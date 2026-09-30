@@ -7,6 +7,9 @@ from .records import IterationRecord, SolveResult, TerminationReason
 from .base import IterativeSolver, Checkpoint
 from .cg import ConjugateGradient
 from .stationary import Richardson
+from .sequence import CarryoverNote, SequenceStep, describe_carryover, solve_sequence
+from .multistart import (MultiStartRunner, MultiStartResult, PathOutcome,
+                         StartPoint)
 
 __all__ = [
     "LinearSystem", "PreconditionError",
@@ -15,4 +18,6 @@ __all__ = [
     "IterationRecord", "SolveResult", "TerminationReason",
     "IterativeSolver", "Checkpoint",
     "ConjugateGradient", "Richardson",
+    "CarryoverNote", "SequenceStep", "describe_carryover", "solve_sequence",
+    "MultiStartRunner", "MultiStartResult", "PathOutcome", "StartPoint",
 ]

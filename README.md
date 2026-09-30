@@ -21,6 +21,17 @@
   SHA-256、停止条件数学设定与求解器参数；原进度恢复严格校验身份，
   跨方法或换问题只能受控地从旧近似解重新开始。
 - `numexp/reference.py` — 小规模稠密直接求解对照、SPD/稀疏/非对称/不定/病态矩阵生成。
+- `numexp/sequence.py` — **问题序列**：`solve_sequence` 依次求解一系列相关但
+  不同的问题，把上一问题的近似解作为下一问题的起点（热启动），同时从零向量
+  冷启动对照；每次求解独立记录目标问题身份与收敛判断，上一问题的剩余迭代
+  状态不会被当作兼容检查点。`describe_carryover` 在矩阵、右端项或容差变化时
+  明确说明可沿用的内容（维度不变时仅近似解 x 可作初值，内部状态一律不沿用）。
+- `numexp/multistart.py` — **多起点统一预算**：`MultiStartRunner` 让所有路径
+  共享一个总迭代预算、按轮分片下发；某条路径失败（数值异常/前提拒绝）或停滞
+  （残差长期不改善）即被隔离，不影响其他路径继续；最终选择以当前问题的真实
+  残差 `||b - Ax||` 为依据。工作目录中的 manifest 记录每条路径的预算、来源与
+  结果，暂停后可用更大预算重开；每条路径使用独立检查点，作为起点的旧检查点
+  只读、绝不覆盖。
 
 核心求解循环与 CG/Richardson 均为手写实现，直接求解器仅用于小规模对照。
 
@@ -43,3 +54,17 @@ python -m experiments.run_experiments   # 对照/病态/不收敛/前提拒绝/�
   `restart_from` 的只读来源；若直接把源路径同时作为目标路径，也不会回写或删除旧记录。
 - 矩阵变化、右端项变化、停止条件变化但仍请求原进度恢复时，会在迭代前抛出明确错误，
   不会沿用旧内部状态后只报告预算耗尽。
+
+## 问题序列与多起点
+
+- **问题序列**：`solve_sequence(problems, solver_factory)` 逐步求解相关问题；
+  `solver_factory` 每次返回全新求解器（不带检查点），热启动只传递上一问题的
+  近似解 x，新运行从迭代 0 重新记录；`SequenceStep.carryover` 给出本步相对
+  上一步"什么变了、什么能沿用"的明确说明。
+- **多起点**：`MultiStartRunner(problem, solver_factory, criterion_factory,
+  starts, total_budget, workdir)` 统一分配预算；`StartPoint` 支持零向量、
+  用户初值或 `restart_from=旧检查点`（只读）三种来源；`MultiStartResult`
+  汇报各路径状态（converged / budget_exhausted / failed / stagnant）、
+  各自消耗的预算与当前问题真实残差，并按真实残差最小选出最优解。
+  中断后用同一 `workdir` 与更大 `total_budget` 重开即可继续，各路径的
+  预算、来源与结果都从 manifest 恢复；换问题后不能在同一 workdir 重开。

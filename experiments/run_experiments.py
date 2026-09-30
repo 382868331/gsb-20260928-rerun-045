@@ -12,7 +12,8 @@ from pathlib import Path
 import numpy as np
 
 from numexp import (ConjugateGradient, Richardson, RelativeResidual,
-                    PreconditionError, LinearSystem)
+                    PreconditionError, LinearSystem, solve_sequence,
+                    MultiStartRunner, StartPoint)
 from numexp.reference import (direct_solve, spd_1d_poisson,
                               spd_sparse_laplacian, nonsymmetric_system,
                               indefinite_system)
@@ -124,12 +125,68 @@ def experiment_checkpoint_resume() -> None:
               f"iteration={json.loads(source_meta)['iteration']}")
 
 
+def experiment_problem_sequence() -> None:
+    _print_header("实验6：相关问题序列——热启动与冷启动对照（n=60）")
+    base, _ = spd_1d_poisson(60, seed=60)
+    problems = [base] + [LinearSystem(base.A, base.b + 0.05 * k)
+                         for k in (1, 2, 3)]
+    steps = solve_sequence(
+        problems,
+        lambda: ConjugateGradient(RelativeResidual(tol=1e-10, max_iter=500)))
+    for step in steps:
+        print(f"[问题{step.index}] 热启动迭代 {step.warm.iterations} "
+              f"({step.warm.reason.value}) | 冷启动迭代 {step.cold.iterations} "
+              f"({step.cold.reason.value})")
+        print(f"        目标问题独立记录: warm.n={step.warm.problem_identity['n']}, "
+              f"continuation={step.warm.continuation}")
+        if step.carryover is not None:
+            print(f"        可沿用说明: {step.carryover.text}")
+
+
+def experiment_multistart_budget() -> None:
+    _print_header("实验7：多起点统一预算——失败隔离、暂停重开（n=60）")
+    problem, info = spd_1d_poisson(60, seed=61)
+
+    def factory(checkpoint, criterion):
+        if checkpoint.endswith("path-1"):
+            return Richardson(1.0, criterion, checkpoint=checkpoint)  # 发散路径
+        return ConjugateGradient(criterion, checkpoint=checkpoint)
+
+    starts = [StartPoint("cg-zero"),
+              StartPoint("richardson-divergent"),
+              StartPoint("cg-ones", x0=np.ones(problem.n))]
+    with tempfile.TemporaryDirectory() as tmp:
+        workdir = Path(tmp) / "multistart"
+        make = lambda budget: MultiStartRunner(
+            problem, factory,
+            lambda b: RelativeResidual(tol=1e-10, max_iter=b),
+            starts, total_budget=budget, workdir=workdir, slice_iter=5)
+        first = make(12).run()
+        print(f"[第一段] 预算12用毕: used={first.used_budget}, "
+              f"best={first.best_label} 残差 {first.best_residual:.3e}")
+        for p in first.paths:
+            print(f"        路径 {p.label}: 状态={p.status}, 来源={p.origin}, "
+                  f"已用迭代={p.iterations}, 真实残差={p.residual_norm:.3e}")
+        second = make(600).run()
+        print(f"[重开段] 预算600: used={second.used_budget}, "
+              f"best={second.best_label} 残差 {second.best_residual:.3e}, "
+              f"收敛={second.converged}")
+        for p in second.paths:
+            print(f"        路径 {p.label}: 状态={p.status}, "
+                  f"累计迭代={p.iterations}, 真实残差={p.residual_norm:.3e}")
+        err = float(np.linalg.norm(second.best_x - info["x_exact"])
+                    / np.linalg.norm(info["x_exact"]))
+        print(f"        最优解与精确解相对误差: {err:.3e}")
+
+
 def main() -> None:
     experiment_reference_check()
     experiment_ill_conditioned()
     experiment_divergent()
     experiment_precondition_reject()
     experiment_checkpoint_resume()
+    experiment_problem_sequence()
+    experiment_multistart_budget()
 
 
 if __name__ == "__main__":
