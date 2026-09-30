@@ -63,10 +63,20 @@ class IterativeSolver:
                 if not isinstance(v, np.ndarray)
                 and isinstance(v, (int, float, bool, np.generic))]
 
+    def solver_settings(self) -> dict:
+        """会改变迭代数学过程的求解器设定；由子类补充。"""
+        return {}
+
     # ---- 统一驱动 -----------------------------------------------------
 
     def solve(self, problem: LinearSystem, x0: np.ndarray | None = None,
-              history: list[IterationRecord] | None = None) -> SolveResult:
+              history: list[IterationRecord] | None = None,
+              continuation: str = "resume",
+              restart_from: str | Checkpoint | None = None) -> SolveResult:
+        if continuation not in ("resume", "restart"):
+            raise ValueError("continuation 必须是 'resume' 或 'restart'")
+        if continuation == "resume" and restart_from is not None:
+            raise ValueError("restart_from 只能与 continuation='restart' 一起使用")
         self.validate(problem)
         if x0 is None:
             x0 = np.zeros(problem.n)
@@ -76,13 +86,43 @@ class IterativeSolver:
             raise PreconditionError("x0 形状与问题维度不一致")
 
         start_iter = 0
-        if self.checkpoint is not None and self.checkpoint.exists():
+        checkpoint_read_only = False
+        continuation_used = "fresh"
+        source_checkpoint = None
+        if restart_from is not None:
+            source_checkpoint = (restart_from if isinstance(restart_from, Checkpoint)
+                                 else Checkpoint(restart_from))
+            if not source_checkpoint.exists():
+                raise FileNotFoundError(f"接续源检查点不存在：{source_checkpoint.path}")
+            if (self.checkpoint is not None and self.checkpoint.exists()
+                    and (self.checkpoint.resolved_path()
+                         != source_checkpoint.resolved_path())):
+                raise ValueError(
+                    "目标检查点已存在；受控重新开始应使用新的目标路径，"
+                    "不能覆盖其他运行记录")
+            if (self.checkpoint is not None
+                    and self.checkpoint.resolved_path()
+                    == source_checkpoint.resolved_path()):
+                checkpoint_read_only = True
+        elif continuation == "restart" and self.checkpoint is not None and self.checkpoint.exists():
+            source_checkpoint = self.checkpoint
+            checkpoint_read_only = True
+
+        if source_checkpoint is not None and source_checkpoint.exists():
+            old_iteration, old_x, _ = source_checkpoint.approximation(problem)
+            state = self.initial_state(problem, old_x)
+            start_iter = 0
+            continuation_used = f"restarted_from_iteration_{old_iteration}"
+        elif continuation == "resume" and self.checkpoint is not None and self.checkpoint.exists():
+            self.checkpoint.assert_resumable(
+                self.name, problem, self.criterion, self.solver_settings())
             start_iter, arrays, meta = self.checkpoint.load(self.name)
             state = self.initial_state(problem, x0)
             for key in meta.get("scalar_keys", []):
                 if key in arrays:
                     state[key] = arrays.pop(key).item()
             state.update(arrays)
+            continuation_used = "resumed"
         else:
             state = self.initial_state(problem, x0)
 
@@ -112,9 +152,12 @@ class IterativeSolver:
                     r_norm = log(iteration, state["x"])
                     if self.criterion.check(iteration, state["x"], problem, r_norm):
                         break
-                    if self.checkpoint is not None:
+                    if self.checkpoint is not None and not checkpoint_read_only:
                         self.checkpoint.save(
                             self.name, iteration, self._state_arrays(state),
+                            problem_identity=problem.identity(),
+                            criterion_signature=self.criterion.signature(),
+                            solver_settings=self.solver_settings(),
                             scalar_keys=self._scalar_keys(state))
                     self.criterion.enforce_budget(iteration)
         except NumericalBreakdown as exc:
@@ -130,8 +173,12 @@ class IterativeSolver:
             reason = TerminationReason.NUMERICAL_BREAKDOWN
             message = f"第 {iteration} 步浮点异常：{exc}"
 
-        if reason is TerminationReason.CONVERGED and self.checkpoint is not None:
+        if (reason is TerminationReason.CONVERGED and self.checkpoint is not None
+                and not checkpoint_read_only):
             self.checkpoint.remove()
 
         return SolveResult(x=state["x"].copy(), reason=reason,
-                           message=message, history=recs)
+                           message=message, history=recs,
+                           problem_identity=problem.identity(),
+                           solver_name=self.name,
+                           continuation=continuation_used)

@@ -30,6 +30,9 @@ class Richardson(IterativeSolver):
             from .problems import PreconditionError
             raise PreconditionError("omega 必须是非零有限值")
 
+    def solver_settings(self) -> dict:
+        return {"omega": self.omega}
+
     def initial_state(self, problem, x0):
         return {"x": x0.copy()}
 

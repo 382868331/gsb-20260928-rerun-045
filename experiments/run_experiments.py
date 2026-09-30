@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import tempfile
+import json
 from pathlib import Path
 
 import numpy as np
 
 from numexp import (ConjugateGradient, Richardson, RelativeResidual,
-                    PreconditionError)
+                    PreconditionError, LinearSystem)
 from numexp.reference import (direct_solve, spd_1d_poisson,
                               spd_sparse_laplacian, nonsymmetric_system,
                               indefinite_system)
@@ -74,10 +75,10 @@ def experiment_precondition_reject() -> None:
 
 
 def experiment_checkpoint_resume() -> None:
-    _print_header("实验5：检查点续算（稀疏拉普拉斯 n=500）")
-    problem, info = spd_sparse_laplacian(500)
+    _print_header("实验5：检查点原进度恢复与受控重新开始（n=80）")
+    problem, info = spd_sparse_laplacian(80)
     with tempfile.TemporaryDirectory() as tmp:
-        ckpt = Path(tmp) / "cg"
+        ckpt = Path(tmp) / "cg-original"
         first = ConjugateGradient(
             RelativeResidual(tol=1e-12, max_iter=5), checkpoint=str(ckpt)).solve(problem)
         print(f"[第一段] 预算5步后: {first.reason.value}, 迭代 {first.iterations}, "
@@ -91,6 +92,36 @@ def experiment_checkpoint_resume() -> None:
                     / np.linalg.norm(info["x_exact"]))
         print(f"        与精确解相对误差: {err:.3e}")
         print(f"        检查点收敛后已清理: {not ckpt.with_suffix('.npz').exists()}")
+
+        restart_problem, _ = spd_1d_poisson(80, seed=80)
+        source = Path(tmp) / "cg-restart-source"
+        old = ConjugateGradient(
+            RelativeResidual(tol=1e-12, max_iter=4),
+            checkpoint=str(source)).solve(restart_problem)
+        print(f"\n[旧记录] CG 迭代 {old.iterations} 后停止: {old.reason.value}")
+        variants = (
+            ("矩阵改变", LinearSystem(restart_problem.A + 0.001 * np.eye(80),
+                                      restart_problem.b),
+             RelativeResidual(tol=5e-2, max_iter=5000)),
+            ("右端项改变", LinearSystem(restart_problem.A,
+                                        restart_problem.b + 0.1),
+             RelativeResidual(tol=5e-2, max_iter=5000)),
+            ("停止条件改变", restart_problem,
+             RelativeResidual(tol=5e-2, max_iter=5000)),
+        )
+        for index, (tag, new_problem, criterion) in enumerate(variants):
+            target = Path(tmp) / f"richardson-new-{index}"
+            result = Richardson(
+                0.4, criterion, checkpoint=str(target)
+            ).solve(new_problem, continuation="restart",
+                     restart_from=str(source))
+            print(f"[{tag}] {result.continuation}: 第0步真实残差 "
+                  f"{result.history[0].residual_norm:.3e} -> "
+                  f"{result.residual_history[-1]:.3e}, "
+                  f"verify={result.verify(new_problem, criterion.tol)}")
+        source_meta = source.with_suffix(".json").read_text(encoding="utf-8")
+        print(f"        旧记录保留: solver={json.loads(source_meta)['solver']}, "
+              f"iteration={json.loads(source_meta)['iteration']}")
 
 
 def main() -> None:

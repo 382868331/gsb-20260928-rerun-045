@@ -39,6 +39,9 @@ class SolveResult:
     reason: TerminationReason
     message: str
     history: list[IterationRecord] = field(default_factory=list)
+    problem_identity: dict = field(default_factory=dict)
+    solver_name: str = ""
+    continuation: str = "fresh"
 
     @property
     def success(self) -> bool:

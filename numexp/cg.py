@@ -28,6 +28,9 @@ class ConjugateGradient(IterativeSolver):
         # CG 前提：A 必须对称正定；不满足则直接拒绝。
         problem.check_spd(self.spd_tol)
 
+    def solver_settings(self) -> dict:
+        return {"spd_tol": self.spd_tol}
+
     def initial_state(self, problem, x0):
         r = problem.true_residual(x0)
         return {"x": x0.copy(), "r": r, "p": r.copy(),

@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import numpy as np
 from numpy.typing import ArrayLike
 
@@ -40,6 +43,15 @@ class LinearSystem(Problem):
         self.A = A
         self.b = b
         self.n = A.shape[0]
+
+    def identity(self) -> dict:
+        """返回由矩阵和右端项内容确定的问题身份。"""
+        return {
+            "type": type(self).__name__,
+            "n": int(self.n),
+            "A_sha256": _fingerprint_matrix(self.A),
+            "b_sha256": _fingerprint_vector(self.b),
+        }
 
     def matvec(self, x: np.ndarray) -> np.ndarray:
         """计算 A @ x；支持稀疏矩阵。"""
@@ -95,3 +107,40 @@ class LinearSystem(Problem):
         dense = self.A.toarray() if hasattr(self.A, "toarray") else np.asarray(self.A)
         if np.linalg.matrix_rank(dense) < self.n:
             raise PreconditionError("矩阵奇异")
+
+
+def _fingerprint_vector(values: np.ndarray) -> str:
+    values = np.ascontiguousarray(values, dtype=np.float64)
+    digest = hashlib.sha256()
+    digest.update(json.dumps({"shape": values.shape}).encode("utf-8"))
+    digest.update(values.tobytes())
+    return digest.hexdigest()
+
+
+def _fingerprint_matrix(A) -> str:
+    digest = hashlib.sha256()
+    if hasattr(A, "tocoo"):
+        sparse = A.tocoo(copy=True)
+        sparse.sum_duplicates()
+        nonzero = sparse.data != 0.0
+        rows = sparse.row[nonzero]
+        cols = sparse.col[nonzero]
+        data = sparse.data[nonzero]
+        order = np.lexsort((cols, rows))
+        rows = rows[order].astype(np.int64, copy=False)
+        cols = cols[order].astype(np.int64, copy=False)
+        data = np.ascontiguousarray(data[order], dtype=np.float64)
+        entries = (rows, cols, data)
+        shape = sparse.shape
+    else:
+        dense = np.asarray(A, dtype=np.float64)
+        rows, cols = np.nonzero(dense)
+        entries = (rows.astype(np.int64, copy=False),
+                   cols.astype(np.int64, copy=False),
+                   np.ascontiguousarray(dense[rows, cols], dtype=np.float64))
+        shape = dense.shape
+
+    digest.update(json.dumps({"shape": shape}).encode("utf-8"))
+    for values in entries:
+        digest.update(np.ascontiguousarray(values).tobytes())
+    return digest.hexdigest()
