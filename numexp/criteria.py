@@ -17,6 +17,14 @@ class BudgetExhausted(Exception):
     """迭代预算用尽。"""
 
 
+class Stagnated(Exception):
+    """迭代停滞：真实残差在一个窗口内没有实质下降。
+
+    与预算用尽区分：停滞说明当前方法/起点组合暂时没有进展，
+    多起点场景下应把剩余预算让给其他路径。
+    """
+
+
 @dataclass
 class StoppingCriterion:
     """停止条件基类。
@@ -75,3 +83,41 @@ class CombinedCriterion(StoppingCriterion):
     def check(self, iteration, x, problem, residual_norm) -> bool:
         return all(c.check(iteration, x, problem, residual_norm)
                    for c in self.conditions)
+
+
+@dataclass
+class StagnationGuard(StoppingCriterion):
+    """包装精度条件：窗口内真实残差下降不足则抛 Stagnated。
+
+    预算与数值异常仍委托给被包装的条件处理；停滞判定只看
+    基类每步重算的真实残差范数。
+    """
+
+    inner: StoppingCriterion | None = None
+    window: int = 30
+    min_decay: float = 0.9
+
+    def __post_init__(self):
+        if self.inner is None:
+            self.inner = RelativeResidual()
+        self._residuals: list[float] = []
+
+    def signature(self) -> dict:
+        return {"type": type(self).__name__,
+                "inner": self.inner.signature(),
+                "window": self.window,
+                "min_decay": self.min_decay}
+
+    def enforce_budget(self, iteration: int) -> None:
+        self.inner.enforce_budget(iteration)
+
+    def check(self, iteration, x, problem, residual_norm) -> bool:
+        history = self._residuals
+        history.append(residual_norm)
+        if len(history) > self.window:
+            reference = history[-1 - self.window]
+            if residual_norm > self.min_decay * reference:
+                raise Stagnated(
+                    f"第 {iteration} 步判定停滞：最近 {self.window} 步真实残差 "
+                    f"从 {reference:.3e} 仅变为 {residual_norm:.3e}")
+        return self.inner.check(iteration, x, problem, residual_norm)

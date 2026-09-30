@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from .criteria import (StoppingCriterion, RelativeResidual, BudgetExhausted,
-                       NumericalBreakdown)
+                       NumericalBreakdown, Stagnated)
 from .checkpoint import Checkpoint
 from .problems import LinearSystem
 from .records import IterationRecord, SolveResult, TerminationReason
@@ -165,6 +165,9 @@ class IterativeSolver:
             message = str(exc)
         except BudgetExhausted as exc:
             reason = TerminationReason.BUDGET_EXHAUSTED
+            message = str(exc)
+        except Stagnated as exc:
+            reason = TerminationReason.STAGNATED
             message = str(exc)
         except ZeroDivisionError as exc:
             reason = TerminationReason.NUMERICAL_BREAKDOWN

@@ -2,17 +2,24 @@
 
 from .problems import LinearSystem, PreconditionError
 from .criteria import (StoppingCriterion, RelativeResidual, CombinedCriterion,
-                       BudgetExhausted)
+                       StagnationGuard, BudgetExhausted, Stagnated)
 from .records import IterationRecord, SolveResult, TerminationReason
 from .base import IterativeSolver, Checkpoint
 from .cg import ConjugateGradient
 from .stationary import Richardson
+from .reuse import ReuseReport, assess_reuse
+from .series import SeriesStep, SeriesResult, solve_problem_series
+from .multistart import (StartPath, PathRecord, MultiStartResult,
+                         MultiStartSession)
 
 __all__ = [
     "LinearSystem", "PreconditionError",
     "StoppingCriterion", "RelativeResidual", "CombinedCriterion",
-    "BudgetExhausted",
+    "StagnationGuard", "BudgetExhausted", "Stagnated",
     "IterationRecord", "SolveResult", "TerminationReason",
     "IterativeSolver", "Checkpoint",
     "ConjugateGradient", "Richardson",
+    "ReuseReport", "assess_reuse",
+    "SeriesStep", "SeriesResult", "solve_problem_series",
+    "StartPath", "PathRecord", "MultiStartResult", "MultiStartSession",
 ]

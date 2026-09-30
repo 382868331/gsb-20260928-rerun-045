@@ -13,6 +13,7 @@ import numpy as np
 
 from numexp import (ConjugateGradient, Richardson, RelativeResidual,
                     PreconditionError, LinearSystem)
+from numexp import (StartPath, MultiStartSession, solve_problem_series)
 from numexp.reference import (direct_solve, spd_1d_poisson,
                               spd_sparse_laplacian, nonsymmetric_system,
                               indefinite_system)
@@ -130,6 +131,66 @@ def main() -> None:
     experiment_divergent()
     experiment_precondition_reject()
     experiment_checkpoint_resume()
+    experiment_problem_series()
+    experiment_multistart()
+
+
+def experiment_problem_series() -> None:
+    _print_header("实验6：相关问题序列——热启动与冷启动对照")
+    base, _ = spd_1d_poisson(60, seed=6)
+    problems = [
+        base,
+        LinearSystem(base.A + 0.02 * np.eye(base.n), base.b),
+        LinearSystem(base.A + 0.02 * np.eye(base.n), base.b + 0.3),
+    ]
+    make_solver = lambda: ConjugateGradient(
+        RelativeResidual(tol=1e-10, max_iter=1000))
+    series = solve_problem_series(problems, make_solver)
+    for step in series.steps:
+        print(f"[问题{step.index}] 冷启动: {step.cold.iterations} 步, "
+              f"残差 {step.cold.residual_history[-1]:.3e}")
+        if step.warm is not None:
+            print(f"         热启动: {step.warm.iterations} 步, "
+                  f"初值残差 {step.warm.history[0].residual_norm:.3e} -> "
+                  f"{step.warm.residual_history[-1]:.3e}")
+        if step.reuse is not None:
+            print("         " + step.reuse.summary().replace(chr(10), chr(10) + "         "))
+
+
+def experiment_multistart() -> None:
+    _print_header("实验7：多起点统一预算——失败隔离、暂停重开、按真实残差选择")
+    problem, _ = spd_1d_poisson(40)
+
+    def make(criterion, checkpoint, path):
+        omega = {"慢速": 0.1, "合适": 0.4, "发散": 1.0}[path.label]
+        return Richardson(omega, criterion, checkpoint=checkpoint)
+
+    paths = [StartPath("慢速", origin="fresh"),
+             StartPath("合适", origin="fresh"),
+             StartPath("发散", origin="fresh")]
+    with tempfile.TemporaryDirectory() as tmp:
+        session_dir = Path(tmp) / "multistart"
+        session = MultiStartSession(
+            problem, make, paths, total_budget=200,
+            criterion=RelativeResidual(tol=1e-8),
+            stagnation=(50, 0.9), session_dir=session_dir)
+        first = session.run()
+        print(f"[第一段] 预算 {first.budget_used}/{first.budget_total}")
+        for r in first.records:
+            print(f"  路径[{r.label}] 来源={r.origin} 状态={r.status} "
+                  f"已耗迭代={r.iterations}")
+        restored = MultiStartSession.load(session_dir, problem, make,
+                                          criterion=RelativeResidual(tol=1e-8))
+        second = restored.run(extra_budget=30000)
+        print(f"[重开追加预算后] 预算 {second.budget_used}/{second.budget_total}")
+        for r in second.records:
+            residual = (f"{r.best_residual:.3e}"
+                        if r.best_residual is not None else "无")
+            print(f"  路径[{r.label}] 状态={r.status} 累计迭代={r.iterations} "
+                  f"真实残差={residual}")
+        best = second.best(problem)
+        print(f"  最终选择: 路径[{best.label}]，按当前问题重算残差 "
+              f"{problem.residual_norm(best.x):.3e}，收敛={best.converged}")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ class TerminationReason(enum.Enum):
     BUDGET_EXHAUSTED = "budget_exhausted"  # 预算用尽，不能叫成功
     NUMERICAL_BREAKDOWN = "numerical_breakdown"  # NaN/Inf/除零等异常
     PRECONDITION_FAILED = "precondition_failed"  # 方法前提被破坏
+    STAGNATED = "stagnated"          # 残差长期无实质下降
 
     @property
     def success(self) -> bool:
