@@ -27,6 +27,14 @@ class StoppingCriterion:
 
     max_iter: int = 1000
 
+    def settings_key(self) -> dict:
+        """影响迭代状态含义的关键求解设定（精度容差等）。
+
+        ``max_iter`` 只是预算，恢复时允许放宽/收紧预算，因此不包含在内。
+        子类应覆盖此方法声明自己的精度参数。
+        """
+        return {"type": type(self).__name__}
+
     def check(self, iteration: int, x: np.ndarray, problem: LinearSystem,
               residual_norm: float) -> bool:
         raise NotImplementedError
@@ -49,6 +57,9 @@ class RelativeResidual(StoppingCriterion):
 
     tol: float = 1e-8
 
+    def settings_key(self) -> dict:
+        return {"type": type(self).__name__, "tol": float(self.tol)}
+
     def check(self, iteration, x, problem, residual_norm) -> bool:
         b_norm = float(np.linalg.norm(problem.b))
         scale = b_norm if b_norm > 0.0 else 1.0
@@ -60,6 +71,10 @@ class CombinedCriterion(StoppingCriterion):
     """组合多个精度条件，全部满足才停止（预算与异常仍由基类统一处理）。"""
 
     conditions: tuple = ()
+
+    def settings_key(self) -> dict:
+        return {"type": type(self).__name__,
+                "conditions": tuple(c.settings_key() for c in self.conditions)}
 
     def check(self, iteration, x, problem, residual_norm) -> bool:
         return all(c.check(iteration, x, problem, residual_norm)

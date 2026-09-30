@@ -5,6 +5,8 @@ from .criteria import (StoppingCriterion, RelativeResidual, CombinedCriterion,
                        BudgetExhausted)
 from .records import IterationRecord, SolveResult, TerminationReason
 from .base import IterativeSolver, Checkpoint
+from .checkpoint import CheckpointMismatchError
+from .problems import matrix_fingerprint, vector_fingerprint
 from .cg import ConjugateGradient
 from .stationary import Richardson
 
@@ -13,6 +15,7 @@ __all__ = [
     "StoppingCriterion", "RelativeResidual", "CombinedCriterion",
     "BudgetExhausted",
     "IterationRecord", "SolveResult", "TerminationReason",
-    "IterativeSolver", "Checkpoint",
+    "IterativeSolver", "Checkpoint", "CheckpointMismatchError",
+    "matrix_fingerprint", "vector_fingerprint",
     "ConjugateGradient", "Richardson",
 ]

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 from numpy.typing import ArrayLike
 
@@ -18,6 +20,30 @@ class Problem:
     """所有数值问题的抽象基类。"""
 
     n: int
+
+
+def matrix_fingerprint(A) -> str:
+    """对矩阵内容做与内存布局无关的内容指纹（支持 scipy 稀疏矩阵）。"""
+    if hasattr(A, "toarray") and hasattr(A, "data"):
+        from scipy import sparse
+        csr = sparse.csr_matrix(A)
+        payload = (b"csr" + np.asarray(csr.shape, dtype=np.int64).tobytes()
+                   + csr.indptr.astype(np.int64).tobytes()
+                   + csr.indices.astype(np.int64).tobytes()
+                   + csr.data.tobytes())
+    else:
+        dense = np.ascontiguousarray(np.asarray(A, dtype=float))
+        payload = b"dense" + np.asarray(dense.shape, dtype=np.int64).tobytes() \
+            + dense.tobytes()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def vector_fingerprint(b: ArrayLike) -> str:
+    """对右端向量内容做指纹。"""
+    arr = np.ascontiguousarray(np.asarray(b, dtype=float))
+    return hashlib.sha256(b"vec" + np.asarray(arr.shape, dtype=np.int64).tobytes()
+                          + arr.tobytes()) \
+        .hexdigest()[:16]
 
 
 class LinearSystem(Problem):
@@ -40,6 +66,23 @@ class LinearSystem(Problem):
         self.A = A
         self.b = b
         self.n = A.shape[0]
+
+    @property
+    def identity(self) -> dict:
+        """问题身份：维度、矩阵指纹与右端向量指纹。
+
+        矩阵与右端向量分别留指纹，恢复检查点时可指出究竟是哪一部分变了。
+        """
+        return {"n": int(self.n),
+                "A": matrix_fingerprint(self.A),
+                "b": vector_fingerprint(self.b)}
+
+    @property
+    def problem_id(self) -> str:
+        """问题的完整身份标识（A、b 同时相同才一致）。"""
+        ident = self.identity
+        raw = f"n={ident['n']};A={ident['A']};b={ident['b']}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
     def matvec(self, x: np.ndarray) -> np.ndarray:
         """计算 A @ x；支持稀疏矩阵。"""

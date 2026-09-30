@@ -24,6 +24,9 @@ class Richardson(IterativeSolver):
         super().__init__(criterion, record_solutions, checkpoint)
         self.omega = float(omega)
 
+    def solver_settings(self) -> dict:
+        return {"name": self.name, "omega": self.omega}
+
     def validate(self, problem: LinearSystem) -> None:
         # Richardson 只要求问题本身是合法方阵方程组；收敛性由实验案例体现。
         if not np.isfinite(self.omega) or self.omega == 0.0:

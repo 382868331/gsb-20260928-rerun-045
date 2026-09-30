@@ -6,7 +6,7 @@ import numpy as np
 
 from .criteria import (StoppingCriterion, RelativeResidual, BudgetExhausted,
                        NumericalBreakdown)
-from .checkpoint import Checkpoint
+from .checkpoint import Checkpoint, CheckpointMismatchError
 from .problems import LinearSystem
 from .records import IterationRecord, SolveResult, TerminationReason
 
@@ -63,27 +63,78 @@ class IterativeSolver:
                 if not isinstance(v, np.ndarray)
                 and isinstance(v, (int, float, bool, np.generic))]
 
+    def solver_settings(self) -> dict:
+        """影响迭代内部状态含义的求解器参数；恢复原进度时必须一致。
+
+        预算（criterion.max_iter）不在其中：允许放宽预算后续算。
+        子类（如带步长/松弛参数的方法）应覆盖并加入对应参数。
+        """
+        return {"name": self.name}
+
+    def _settings_key(self) -> dict:
+        return {"solver": self.solver_settings(),
+                "criterion": self.criterion.settings_key()}
+
     # ---- 统一驱动 -----------------------------------------------------
 
     def solve(self, problem: LinearSystem, x0: np.ndarray | None = None,
-              history: list[IterationRecord] | None = None) -> SolveResult:
+              history: list[IterationRecord] | None = None,
+              continuation: str = "resume") -> SolveResult:
+        """求解 A x = b。
+
+        continuation 控制已有检查点的用法：
+
+        * ``"resume"``（默认）：恢复原问题的原进度，迭代号/内部状态
+          （如 CG 的递推残差与搜索方向）原样延续。恢复前严格校验问题
+          身份（A、b）与关键求解设定，不一致立即抛
+          ``CheckpointMismatchError`` 明确拒绝，而不是盲目迭代。
+          ``max_iter`` 属于预算，允许调整；精度设定改变则拒绝。
+        * ``"restart"``：受控接续，只把检查点里的旧近似解 x 当作新问题
+          的初值，内部状态全部重新初始化，迭代从 0 重新计数。
+          此时检查点只读，绝不覆盖旧记录。
+        """
+        if continuation not in ("resume", "restart"):
+            raise ValueError(
+                "continuation 必须是 'resume' 或 'restart'")
         self.validate(problem)
-        if x0 is None:
-            x0 = np.zeros(problem.n)
-        x0 = np.asarray(x0, dtype=float)
-        if x0.shape != (problem.n,):
-            from .problems import PreconditionError
-            raise PreconditionError("x0 形状与问题维度不一致")
 
         start_iter = 0
-        if self.checkpoint is not None and self.checkpoint.exists():
-            start_iter, arrays, meta = self.checkpoint.load(self.name)
+        resumed = False
+        ckpt = self.checkpoint
+        checkpoint_exists = ckpt is not None and ckpt.exists()
+        if checkpoint_exists and continuation == "resume":
+            # 恢复前先核对问题身份与关键设定，不一致立即明确拒绝。
+            ckpt.verify_resume(self.name, problem, self._settings_key())
+            if x0 is None:
+                x0 = np.zeros(problem.n)
+            x0 = np.asarray(x0, dtype=float)
+            if x0.shape != (problem.n,):
+                from .problems import PreconditionError
+                raise PreconditionError("x0 形状与问题维度不一致")
+            start_iter, arrays, meta = ckpt.load(self.name)
             state = self.initial_state(problem, x0)
             for key in meta.get("scalar_keys", []):
                 if key in arrays:
                     state[key] = arrays.pop(key).item()
             state.update(arrays)
+            resumed = True
         else:
+            if checkpoint_exists and continuation == "restart":
+                # 受控接续：只借用旧近似解，旧记录保持只读、绝不覆盖。
+                _, old_x, _old_solver = ckpt.approximate_solution()
+                if old_x.shape != (problem.n,):
+                    raise CheckpointMismatchError(
+                        f"旧近似解维度 {old_x.shape[0]} 与新问题维度 "
+                        f"{problem.n} 不一致，不能作为初值重启")
+                if x0 is None:
+                    x0 = old_x
+                ckpt = None  # 本次重启不写该检查点，保留旧问题的原记录
+            if x0 is None:
+                x0 = np.zeros(problem.n)
+            x0 = np.asarray(x0, dtype=float)
+            if x0.shape != (problem.n,):
+                from .problems import PreconditionError
+                raise PreconditionError("x0 形状与问题维度不一致")
             state = self.initial_state(problem, x0)
 
         recs: list[IterationRecord] = history if history is not None else []
@@ -112,9 +163,12 @@ class IterativeSolver:
                     r_norm = log(iteration, state["x"])
                     if self.criterion.check(iteration, state["x"], problem, r_norm):
                         break
-                    if self.checkpoint is not None:
-                        self.checkpoint.save(
+                    if ckpt is not None:
+                        ckpt.save(
                             self.name, iteration, self._state_arrays(state),
+                            problem_id=problem.problem_id,
+                            problem_identity=problem.identity,
+                            settings_key=self._settings_key(),
                             scalar_keys=self._scalar_keys(state))
                     self.criterion.enforce_budget(iteration)
         except NumericalBreakdown as exc:
@@ -130,8 +184,10 @@ class IterativeSolver:
             reason = TerminationReason.NUMERICAL_BREAKDOWN
             message = f"第 {iteration} 步浮点异常：{exc}"
 
-        if reason is TerminationReason.CONVERGED and self.checkpoint is not None:
-            self.checkpoint.remove()
+        if reason is TerminationReason.CONVERGED and ckpt is not None:
+            ckpt.remove()
 
         return SolveResult(x=state["x"].copy(), reason=reason,
-                           message=message, history=recs)
+                           message=message, history=recs,
+                           problem_id=problem.problem_id,
+                           resumed=resumed)

@@ -17,8 +17,13 @@
   异常分类、检查点存取；新方法只需实现 `validate / initial_state / step`。
 - `numexp/cg.py` — 手写共轭梯度（前提 SPD；非正曲率 breakdown 归类为数值异常）。
 - `numexp/stationary.py` — 手写 Richardson 迭代（用于不收敛/发散实验）。
-- `numexp/checkpoint.py` — npz+json 检查点，原子写入，支持从断点续算，
-  校验求解器身份，收敛后自动清理。
+- `numexp/checkpoint.py` — npz+json 检查点，原子写入，保存问题身份
+  （维度、矩阵 A 与右端向量 b 的内容指纹）与关键求解设定，收敛后自动清理。
+  恢复原进度前严格核对：求解方法、A、b、精度容差任一不一致立即抛
+  `CheckpointMismatchError` 明确拒绝（`max_iter` 属于预算，允许放宽续算）。
+  `solve(..., continuation="restart")` 为受控接续：只借用旧近似解 x 作
+  新问题初值，内部状态全部重建、迭代从 0 计数，检查点只读不覆盖；
+  跨方法（如 Richardson 磨光后交 CG）也只能走 restart。
 - `numexp/reference.py` — 小规模稠密直接求解对照、SPD/稀疏/非对称/不定/病态矩阵生成。
 
 核心求解循环与 CG/Richardson 均为手写实现，直接求解器仅用于小规模对照。

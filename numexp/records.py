@@ -39,6 +39,8 @@ class SolveResult:
     reason: TerminationReason
     message: str
     history: list[IterationRecord] = field(default_factory=list)
+    problem_id: str | None = None   # 本结果对应问题的身份标识
+    resumed: bool = False           # 是否从检查点按原进度恢复
 
     @property
     def success(self) -> bool:

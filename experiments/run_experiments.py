@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from numexp import (ConjugateGradient, Richardson, RelativeResidual,
-                    PreconditionError)
+                    PreconditionError, CheckpointMismatchError)
 from numexp.reference import (direct_solve, spd_1d_poisson,
                               spd_sparse_laplacian, nonsymmetric_system,
                               indefinite_system)
@@ -93,12 +93,66 @@ def experiment_checkpoint_resume() -> None:
         print(f"        检查点收敛后已清理: {not ckpt.with_suffix('.npz').exists()}")
 
 
+def experiment_checkpoint_identity_guard() -> None:
+    _print_header("实验6：换右端向量/矩阵/精度后拒绝原进度恢复")
+    from numexp import LinearSystem, Checkpoint
+    problem, _ = spd_sparse_laplacian(120)
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt = Path(tmp) / "cg"
+        ConjugateGradient(RelativeResidual(tol=1e-12, max_iter=4),
+                          checkpoint=str(ckpt)).solve(problem)
+        rng = np.random.default_rng(0)
+        cases = {
+            "换右端向量 b": LinearSystem(problem.A, rng.standard_normal(problem.n)),
+        }
+        A2 = problem.A.toarray() if hasattr(problem.A, "toarray") else np.array(problem.A)
+        A2[0, 0] += 1.0
+        cases["换矩阵 A"] = LinearSystem(A2, problem.b)
+        for tag, new_problem in cases.items():
+            try:
+                ConjugateGradient(RelativeResidual(tol=1e-12, max_iter=1000),
+                                  checkpoint=str(ckpt)).solve(new_problem)
+                print(f"[{tag}] 未拒绝（错误！）")
+            except CheckpointMismatchError as exc:
+                print(f"[{tag}] 恢复前明确拒绝: {exc}")
+        # 受控重启：借用旧近似解，但新实验不覆盖旧记录
+        new_problem = LinearSystem(problem.A, rng.standard_normal(problem.n))
+        result = ConjugateGradient(
+            RelativeResidual(tol=1e-12, max_iter=1000),
+            checkpoint=str(ckpt)).solve(new_problem, continuation="restart")
+        print(f"[受控重启] {result.reason.value}, 新问题 verify: "
+              f"{result.verify(new_problem)}, 旧记录身份保留: "
+              f"{Checkpoint(str(ckpt)).inspect()['problem_id'] == problem.problem_id}")
+
+
+def experiment_cross_method_restart() -> None:
+    _print_header("实验7：跨方法受控接续（Richardson 磨光 -> CG，区别于原进度恢复）")
+    problem, _ = spd_sparse_laplacian(150)
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt = Path(tmp) / "rich"
+        rich = Richardson(0.4, RelativeResidual(tol=1e-12, max_iter=20),
+                          checkpoint=str(ckpt)).solve(problem)
+        print(f"[Richardson] {rich.reason.value}, 残差 {rich.residual_history[-1]:.3e}")
+        cg = ConjugateGradient(RelativeResidual(tol=1e-12, max_iter=1000),
+                               checkpoint=str(ckpt))
+        try:
+            cg.solve(problem)
+        except CheckpointMismatchError as exc:
+            print(f"[冒充原进度恢复] 已拒绝: {exc}")
+        result = cg.solve(problem, continuation="restart")
+        print(f"[CG 受控重启] {result.reason.value}, 从迭代0计数, "
+              f"初值残差 {result.residual_history[0]:.3e}, "
+              f"终值残差 {result.residual_history[-1]:.3e}")
+
+
 def main() -> None:
     experiment_reference_check()
     experiment_ill_conditioned()
     experiment_divergent()
     experiment_precondition_reject()
     experiment_checkpoint_resume()
+    experiment_checkpoint_identity_guard()
+    experiment_cross_method_restart()
 
 
 if __name__ == "__main__":
