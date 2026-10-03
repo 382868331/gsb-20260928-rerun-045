@@ -405,3 +405,126 @@ def test_multistart_restart_source_checkpoint_not_overwritten(tmp_path):
     assert old_meta["solver"] == "cg"
     assert old_meta["iteration"] == 3
     assert old_meta["problem"] == problem.identity()
+
+
+# ---- 参数连续跟踪 -----------------------------------------------------
+
+def _continuation_family(t):
+    """小问题族：t 小接近单位阵（平稳段），t 大条件数上升（难收敛段）。"""
+    n = 6
+    diag = 1.0 + t * np.arange(1, n + 1)
+    A = np.diag(diag) + 0.05 * t * (np.ones((n, n)) - np.eye(n))
+    return LinearSystem(A, np.ones(n))
+
+
+def _make_continuation(tmp_path=None, budget=3000, **kwargs):
+    from numexp import ContinuationSession
+    x0 = np.linalg.solve(_continuation_family(0.0).A, np.ones(6))
+    options = dict(criterion=RelativeResidual(tol=1e-4),
+                   initial_step=0.5, min_step=1e-3, max_step_iters=5, x0=x0)
+    options.update(kwargs)
+    return ContinuationSession(_continuation_family, 0.0, 1.0,
+                               lambda c: ConjugateGradient(c),
+                               total_budget=budget, **options)
+
+
+def test_continuation_backtracks_and_reaches_end():
+    session = _make_continuation()
+    result = session.run()
+    scheme = result.schemes[0]
+    assert scheme.reached_end and scheme.status == "completed"
+    # 失败尝试存在且消耗计入统一预算
+    failed = [a for a in result.attempts if not a.converged]
+    assert failed, "难收敛段应触发失败回退"
+    assert result.budget_used == sum(a.iterations for a in result.attempts)
+    assert result.budget_used == sum(n.iterations for n in scheme.nodes) + \
+        sum(a.iterations for a in failed)
+    # 每次失败后以更小步长从同一已确认节点重新出发
+    for attempt in failed:
+        retry = next(a for a in result.attempts
+                     if a.t_from == attempt.t_from and a.step < attempt.step)
+        assert retry.t_target < attempt.t_target
+    # 失败尝试的参数不会变成已确认节点（除非后来真正收敛）
+    node_ts = [n.t for n in scheme.nodes]
+    for attempt in failed:
+        later = [a for a in result.attempts
+                 if a.t_target == attempt.t_target and a.converged]
+        if not later:
+            assert attempt.t_target not in node_ts
+    # 每个已确认节点按当前参数重算真实残差都满足精度
+    for node in scheme.nodes[1:]:
+        problem = _continuation_family(node.t)
+        assert problem.residual_norm(node.x) <= 1e-4 * np.linalg.norm(problem.b) * 1.05
+    # 终点解可独立验证
+    final = session.final_solution("main")
+    assert final is not None
+    assert _continuation_family(1.0).residual_norm(final) < 1e-3
+
+
+def test_continuation_incomplete_path_not_substituted(tmp_path):
+    session = _make_continuation(tmp_path, budget=12,
+                                 session_dir=str(tmp_path / "sess"))
+    result = session.run()
+    scheme = result.schemes[0]
+    assert not scheme.reached_end
+    assert result.incomplete and not result.completed
+    # 未到达终点：final_solution 与 compare_at 都不以最近结果代替
+    assert session.final_solution("main") is None
+    assert session.compare_at(1.0) == []
+    # 暂停重开：预算与尝试记录保留，追加预算后沿原路径继续
+    used_before = result.budget_used
+    attempts_before = len(result.attempts)
+    from numexp import ContinuationSession
+    resumed = ContinuationSession.load(tmp_path / "sess", _continuation_family,
+                                       lambda c: ConjugateGradient(c),
+                                       criterion=RelativeResidual(tol=1e-4))
+    assert resumed.budget_used == used_before
+    assert len(resumed.attempts) == attempts_before
+    result2 = resumed.run(extra_budget=3000)
+    assert result2.schemes[0].reached_end
+    assert result2.budget_used > used_before
+    assert len(result2.attempts) > attempts_before
+    assert resumed.final_solution("main") is not None
+
+
+def test_continuation_load_rejects_changed_family(tmp_path):
+    session = _make_continuation(tmp_path, budget=12,
+                                 session_dir=str(tmp_path / "sess"))
+    session.run()
+    from numexp import ContinuationSession
+    with pytest.raises(ValueError, match="不一致"):
+        ContinuationSession.load(tmp_path / "sess",
+                                 lambda t: _continuation_family(t + 1.0),
+                                 lambda c: ConjugateGradient(c))
+
+
+def test_continuation_fork_and_compare_at_same_parameter(tmp_path):
+    session = _make_continuation(tmp_path, budget=3000,
+                                 session_dir=str(tmp_path / "sess"))
+    result = session.run()
+    main = result.schemes[0]
+    assert main.reached_end
+    anchor = main.nodes[1]
+    nodes_before = [(n.t, n.origin) for n in main.nodes]
+    budget_before = result.budget_used
+    # 从旧节点另开方案：原节点与预算记录不被覆盖
+    fork = session.fork_scheme("main", 1, "forked")
+    assert fork.nodes[0].origin == "fork:main#node1"
+    assert fork.nodes[0].t == anchor.t
+    result2 = session.run()
+    assert [(n.t, n.origin) for n in main.nodes] == nodes_before
+    assert result2.schemes[1].reached_end
+    assert result2.budget_used > budget_before
+    # 两条路径在同一参数处的解可比较，残差按该参数问题重算
+    entries = session.compare_at(anchor.t)
+    assert {e["scheme"] for e in entries} == {"main", "forked"}
+    problem = _continuation_family(anchor.t)
+    for entry in entries:
+        assert entry["residual"] == pytest.approx(
+            problem.residual_norm(entry["x"]))
+    # 两条路径都真正到达终点
+    finals = session.compare_at(1.0)
+    assert {e["scheme"] for e in finals} == {"main", "forked"}
+    for entry in finals:
+        assert entry["residual"] < 1e-3
+
