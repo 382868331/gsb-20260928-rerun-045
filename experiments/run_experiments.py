@@ -14,6 +14,7 @@ import numpy as np
 from numexp import (ConjugateGradient, Richardson, RelativeResidual,
                     PreconditionError, LinearSystem)
 from numexp import (StartPath, MultiStartSession, solve_problem_series)
+from numexp import ContinuationSession
 from numexp.reference import (direct_solve, spd_1d_poisson,
                               spd_sparse_laplacian, nonsymmetric_system,
                               indefinite_system)
@@ -133,6 +134,55 @@ def main() -> None:
     experiment_checkpoint_resume()
     experiment_problem_series()
     experiment_multistart()
+    experiment_continuation()
+
+
+def experiment_continuation() -> None:
+    _print_header("实验8：参数连续跟踪——回退推进、分支比较与暂停重开")
+    n = 30
+    b = np.ones(n)
+
+    def make_problem(t):
+        # t<=0.4 时 A=I（平稳段）；之后最小特征值降到 0.05（难收敛段）
+        s = max(0.0, (t - 0.4) / 0.6)
+        c = np.geomspace(10.0 ** (-1.3 * s), 1.0, n)
+        return LinearSystem(np.diag(c), b)
+
+    def make_solver(criterion):
+        return Richardson(omega=1.0, criterion=criterion)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        session = ContinuationSession(
+            make_problem, make_solver, param_start=0.0, param_end=1.0,
+            total_budget=400, criterion=RelativeResidual(tol=1e-6),
+            attempt_budget=200, initial_step=0.6,
+            session_dir=str(Path(tmp) / "cont"))
+        first = session.run()
+        path = first.paths[0]
+        print(f"[预算受限] 状态={path.status} 已耗={first.budget_used} "
+              f"完成={path.completed}（未到达终点时 final_node 为 "
+              f"{path.final_node}）")
+        restored = ContinuationSession.load(
+            Path(tmp) / "cont", make_problem, make_solver,
+            criterion=RelativeResidual(tol=1e-6))
+        second = restored.run(extra_budget=40000)
+        path = second.paths[0]
+        print(f"[重开追加预算] 状态={path.status} 已耗={second.budget_used}")
+        for a in path.attempts:
+            mark = "确认" if a.accepted else "失败"
+            print(f"  尝试 t={a.param:.4f} 步长={a.step:+.4f} "
+                  f"耗={a.cost:4d} {mark} ({a.status})")
+        print("  已确认节点: "
+              + ", ".join(f"t={nd.param:.4f}(耗{nd.cost})"
+                          for nd in path.nodes))
+        # 从中间节点另开方案，两条路径到达同一参数后按真实残差比较
+        mid = len(path.nodes) // 2
+        restored.branch("main", mid, label="alt", initial_step=0.05)
+        restored.run()
+        for entry in restored.compare_at(1.0):
+            print(f"  比较 t=1.0: 路径[{entry['path']}] "
+                  f"真实残差={entry['residual_norm']:.3e} "
+                  f"来源={entry['source']}")
 
 
 def experiment_problem_series() -> None:

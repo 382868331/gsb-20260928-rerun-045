@@ -11,6 +11,9 @@ from .reuse import ReuseReport, assess_reuse
 from .series import SeriesStep, SeriesResult, solve_problem_series
 from .multistart import (StartPath, PathRecord, MultiStartResult,
                          MultiStartSession)
+from .continuation import (ContinuationNode, AttemptRecord,
+                           ContinuationPath, ContinuationResult,
+                           ContinuationSession)
 
 __all__ = [
     "LinearSystem", "PreconditionError",
@@ -22,4 +25,6 @@ __all__ = [
     "ReuseReport", "assess_reuse",
     "SeriesStep", "SeriesResult", "solve_problem_series",
     "StartPath", "PathRecord", "MultiStartResult", "MultiStartSession",
+    "ContinuationNode", "AttemptRecord", "ContinuationPath",
+    "ContinuationResult", "ContinuationSession",
 ]
