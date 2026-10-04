@@ -628,3 +628,205 @@ def test_continuation_start_confirmation_budget_pause_resume(tmp_path):
     assert sum(a.iterations for a in start_attempts) + \
         sum(a.iterations for a in result2.attempts
             if not (a.t_from == 0.0 and a.t_target == 0.0)) == result2.budget_used
+
+
+# ---- 节点核验报告 -----------------------------------------------------
+
+def _report_family(t):
+    n = 6
+    diag = 1.0 + t * np.arange(1, n + 1)
+    A = np.diag(diag) + 0.05 * t * (np.ones((n, n)) - np.eye(n))
+    return LinearSystem(A, np.ones(n))
+
+
+def _make_report_session(tmp_path=None, budget=3000):
+    from numexp import ContinuationSession
+    x0 = np.linalg.solve(_report_family(0.0).A, np.ones(6))
+    kwargs = dict(criterion=RelativeResidual(tol=1e-4),
+                  initial_step=0.5, min_step=1e-3, max_step_iters=5, x0=x0)
+    if tmp_path is not None:
+        kwargs["session_dir"] = str(tmp_path / "sess")
+    return ContinuationSession(_report_family, 0.0, 1.0,
+                               lambda c: ConjugateGradient(c),
+                               total_budget=budget, **kwargs)
+
+
+def test_verification_report_confirmed_nodes_independently_checked():
+    """有效初值：每个确认节点带参数值、独立重算残差、容差与结论。"""
+    session = _make_report_session()
+    session.run()
+    report = session.verification_report()
+    scheme = report["schemes"][0]
+    assert scheme["stopped_at"]["kind"] == "end"
+    assert scheme["unconfirmed_start"] is None
+    nodes = scheme["confirmed_nodes"]
+    assert len(nodes) == len(session.schemes[0].nodes) > 2
+    for entry in nodes:
+        problem = _report_family(entry["t"])
+        assert entry["residual"] == pytest.approx(
+            problem.residual_norm(session.schemes[0].nodes[entry["index"]].x))
+        assert entry["tolerance"]["tol"] == 1e-4
+        assert entry["threshold"] == pytest.approx(
+            1e-4 * np.linalg.norm(problem.b))
+        assert entry["conclusion"] == "confirmed_pass"
+        assert entry["residual"] <= entry["threshold"]
+    # 起点节点为精确初值：零消耗确认
+    assert nodes[0]["t"] == 0.0 and nodes[0]["iterations"] == 0
+    # 失败尝试单独成节，不混入确认节点
+    assert report["failed_attempts"]
+    failed_targets = {(a["t_from"], a["t_target"]) for a in report["failed_attempts"]}
+    node_ts = {n["t"] for n in nodes}
+    for t_from, t_target in failed_targets:
+        if all(a["status"] != "converged"
+               for a in report["failed_attempts"]
+               if a["t_target"] == t_target):
+            assert t_target not in node_ts
+
+
+def test_verification_report_budget_partition_and_text_json(tmp_path):
+    """预算按起点校正/后续推进/失败尝试三类汇总，文本与 JSON 可导出。"""
+    session = _make_report_session(tmp_path)
+    session.run()
+    report = session.verification_report()
+    bg = report["budget"]
+    assert bg["used"] == (bg["start_confirmation"] + bg["advances"]
+                           + bg["failed_attempts"])
+    assert bg["used"] + bg["remaining"] == bg["total"]
+    assert bg["advances"] == sum(n["iterations"]
+                                 for n in report["schemes"][0]["confirmed_nodes"])
+    assert bg["failed_attempts"] == sum(a["iterations"]
+                                         for a in report["failed_attempts"])
+    json_path = tmp_path / "report.json"
+    text_path = tmp_path / "report.txt"
+    json_text = session.export_report_json(json_path)
+    plain_text = session.export_report_text(text_path)
+    parsed = json.loads(json_path.read_text(encoding="utf-8"))
+    assert parsed == json.loads(json_text)
+    assert text_path.read_text(encoding="utf-8") == plain_text
+    assert "节点核验报告" in plain_text
+    assert "已确认节点" in plain_text and "失败尝试" in plain_text
+
+
+def test_verification_report_save_load_stable(tmp_path):
+    """保存恢复后再次导出：节点数值、结论与预算完全一致。"""
+    from numexp import ContinuationSession
+    session = _make_report_session(tmp_path, budget=12)
+    session.run()  # 预算不足，暂停在后续推进上
+    json_before = session.export_report_json()
+    text_before = session.export_report_text()
+    resumed = ContinuationSession.load(tmp_path / "sess", _report_family,
+                                       lambda c: ConjugateGradient(c),
+                                       criterion=RelativeResidual(tol=1e-4))
+    assert resumed.export_report_json() == json_before
+    assert resumed.export_report_text() == text_before
+    # 追加预算跑到终点后再次保存/恢复仍一致
+    resumed.run(extra_budget=3000)
+    resumed.save()
+    json_done = resumed.export_report_json()
+    resumed2 = ContinuationSession.load(tmp_path / "sess", _report_family,
+                                        lambda c: ConjugateGradient(c),
+                                        criterion=RelativeResidual(tol=1e-4))
+    assert resumed2.export_report_json() == json_done
+    assert resumed2.export_report_text() == resumed.export_report_text()
+
+
+def _start_report_family(t):
+    n = 7
+    b = 1.0 + np.arange(n)
+    diag = 2.0 + np.arange(n) + t
+    A = np.diag(diag) + 0.1 * t * (np.ones((n, n)) - np.eye(n))
+    return LinearSystem(A, b)
+
+
+def test_verification_report_invalid_initial_guess_listed_separately():
+    """无效初值：起点未确认，初始猜测单独列出、方案停在起点。"""
+    from numexp import ContinuationSession
+    session = ContinuationSession(_start_report_family, 0.0, 1.0,
+                                  lambda c: ConjugateGradient(c),
+                                  total_budget=3000,
+                                  criterion=RelativeResidual(tol=1e-4),
+                                  initial_step=0.5, min_step=1e-3,
+                                  max_step_iters=2, x0=np.zeros(7))
+    session.run()
+    report = session.verification_report()
+    scheme = report["schemes"][0]
+    assert scheme["confirmed_nodes"] == []
+    assert scheme["stopped_at"] == {"kind": "start_unconfirmed", "t": 0.0}
+    pending = scheme["unconfirmed_start"]
+    assert pending["t"] == 0.0 and pending["status"] == "stalled"
+    assert pending["residual"] == pytest.approx(np.linalg.norm(1.0 + np.arange(7)))
+    assert scheme["budget"]["start_confirmation"] == 0
+    assert scheme["budget"]["advances"] == 0
+    assert scheme["budget"]["failed_attempts"] > 0
+    assert report["failed_attempts"]
+    assert all(a["kind"] == "start_confirmation" for a in report["failed_attempts"])
+    assert report["paused_attempts"] == []
+
+
+def test_verification_report_budget_exhausted_paused_attempt(tmp_path):
+    """预算耗尽：暂停尝试单列，恢复续跑后预算账目保持一致。"""
+    from numexp import ContinuationSession
+    session = ContinuationSession(
+        _start_report_family, 0.0, 1.0, lambda c: ConjugateGradient(c),
+        total_budget=3, criterion=RelativeResidual(tol=1e-12),
+        initial_step=0.5, min_step=1e-3, max_step_iters=10,
+        session_dir=str(tmp_path / "sess"))
+    session.run()
+    report = session.verification_report()
+    scheme = report["schemes"][0]
+    assert scheme["status"] == "paused"
+    assert scheme["stopped_at"]["kind"] == "start_unconfirmed"
+    assert scheme["confirmed_nodes"] == []
+    assert scheme["unconfirmed_start"]["status"] == "paused"
+    assert len(report["paused_attempts"]) == 1
+    paused = report["paused_attempts"][0]
+    assert paused["iterations"] == 3 and paused["status"] == "paused"
+    assert report["failed_attempts"] == []
+    assert report["budget"]["used"] == 3 and report["budget"]["remaining"] == 0
+    # 暂停尝试的消耗不重复计入失败分类，但已在总消耗中扣减
+    assert report["budget"]["start_confirmation"] == 0
+    resumed = ContinuationSession.load(tmp_path / "sess", _start_report_family,
+                                       lambda c: ConjugateGradient(c),
+                                       criterion=RelativeResidual(tol=1e-12))
+    resumed.run(extra_budget=3000)
+    done = resumed.verification_report()
+    bg = done["budget"]
+    assert bg["used"] == (bg["start_confirmation"] + bg["advances"]
+                           + bg["failed_attempts"])
+    assert bg["used"] > 3
+    assert done["schemes"][0]["confirmed_nodes"][0]["t"] == 0.0
+    # 暂停重开不重复扣减：全部尝试消耗之和等于总消耗
+    assert sum(a.iterations for a in resumed.attempts) == bg["used"]
+
+
+def test_verification_report_singular_system_precondition_failure():
+    """奇异系统：前提拒绝列为失败尝试，残差非有限时以 null 导出且 JSON 合法。"""
+    from numexp import ContinuationSession
+
+    def singular(t):
+        n = 4
+        A = np.eye(n)
+        A[0, 0] = 0.0  # 奇异且非正定
+        return LinearSystem(A, np.ones(n))
+
+    session = ContinuationSession(singular, 0.0, 1.0,
+                                  lambda c: ConjugateGradient(c),
+                                  total_budget=100,
+                                  criterion=RelativeResidual(tol=1e-8))
+    session.run()
+    report = session.verification_report()
+    scheme = report["schemes"][0]
+    assert scheme["status"] == "stalled"
+    assert scheme["confirmed_nodes"] == []
+    assert scheme["unconfirmed_start"] is not None
+    failed = report["failed_attempts"]
+    assert len(failed) == 1
+    assert failed[0]["status"] == "precondition_failed"
+    assert failed[0]["iterations"] == 0
+    assert failed[0]["residual"] is None  # inf 不出现在 JSON 中
+    assert report["budget"]["used"] == 0
+    assert report["budget"]["failed_attempts"] == 0
+    json_text = session.export_report_json()
+    json.loads(json_text)  # 合法 JSON（不依赖非标准 NaN/Infinity）
+    plain_text = session.export_report_text()
+    assert "失败尝试" in plain_text and "precondition_failed" in plain_text

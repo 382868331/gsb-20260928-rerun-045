@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -354,6 +355,112 @@ class ContinuationSession:
         node = scheme.nodes[node_index]
         return self.problem_at(node.t).residual_norm(node.x)
 
+    # ---- 节点核验报告 --------------------------------------------------
+
+    def verification_report(self) -> dict:
+        """生成可导出的节点核验报告（dict，可直接 json 序列化）。
+
+        每个已确认节点独立按其自身参数问题重算真实残差，不信任求解时
+        自报值；尚未确认成功的初始猜测与暂停/失败尝试单独成节，
+        绝不混入已确认节点。预算按起点校正、后续推进、失败尝试三类汇总。
+        """
+        criterion_sig = self.criterion.signature()
+        tolerance = _extract_tolerance(self.criterion)
+
+        schemes_section = []
+        for scheme in self.schemes:
+            nodes_section = []
+            for node in scheme.nodes:
+                entry = _verified_node_entry(scheme, node, self.problem_at,
+                                             tolerance, criterion_sig)
+                nodes_section.append(entry)
+
+            unconfirmed = None
+            if scheme.pending is not None:
+                t0 = scheme.pending["t"]
+                x0 = scheme.pending["x"]
+                problem = self.problem_at(t0)
+                unconfirmed = {
+                    "scheme": scheme.label,
+                    "t": _json_number(t0),
+                    "origin": scheme.pending["origin"],
+                    "residual": _json_number(problem.residual_norm(x0)),
+                    "status": scheme.status,
+                }
+
+            start_iters, advance_iters, failed_iters = _partition_budget(
+                scheme, self.attempts, self.t_start)
+            schemes_section.append({
+                "label": scheme.label,
+                "status": scheme.status,
+                "stopped_at": _stopped_at(scheme, self.t_start, self.t_end),
+                "confirmed_nodes": nodes_section,
+                "unconfirmed_start": unconfirmed,
+                "budget": {
+                    "start_confirmation": start_iters,
+                    "advances": advance_iters,
+                    "failed_attempts": failed_iters,
+                    "total": start_iters + advance_iters + failed_iters,
+                },
+            })
+
+        paused_attempts = [_attempt_entry(a) for a in self.attempts
+                           if a.status == "paused"]
+        failed_attempts = [_attempt_entry(a) for a in self.attempts
+                           if not a.converged and a.status != "paused"]
+
+        start_budget = sum(s["budget"]["start_confirmation"]
+                           for s in schemes_section)
+        advance_budget = sum(s["budget"]["advances"] for s in schemes_section)
+        failed_budget = sum(s["budget"]["failed_attempts"]
+                            for s in schemes_section)
+
+        return {
+            "report_type": "continuation_node_verification",
+            "version": SESSION_VERSION,
+            "parameter_range": {
+                "t_start": _json_number(self.t_start),
+                "t_end": _json_number(self.t_end),
+            },
+            "criterion": criterion_sig,
+            "tolerance": tolerance,
+            "budget": {
+                "total": int(self.total_budget),
+                "used": int(self.budget_used),
+                "remaining": int(self.remaining_budget),
+                "start_confirmation": int(start_budget),
+                "advances": int(advance_budget),
+                "failed_attempts": int(failed_budget),
+            },
+            "schemes": schemes_section,
+            "paused_attempts": paused_attempts,
+            "failed_attempts": failed_attempts,
+        }
+
+    def export_report_json(self, path: str | Path | None = None,
+                           indent: int = 2) -> str:
+        """导出 JSON 核验报告；给定 path 时写入文件，返回 JSON 文本。"""
+        text = json.dumps(self.verification_report(), ensure_ascii=False,
+                          indent=indent, allow_nan=True, sort_keys=True)
+        if path is not None:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(path)
+        return text
+
+    def export_report_text(self, path: str | Path | None = None) -> str:
+        """导出简洁文本核验报告；给定 path 时写入文件，返回文本。"""
+        text = _format_report_text(self.verification_report())
+        if path is not None:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(path)
+        return text
+
     # ---- 暂停 / 重开 ---------------------------------------------------
 
     def _identity(self) -> dict:
@@ -451,3 +558,184 @@ class ContinuationSession:
                 step=item["step"], status=item["status"], pending=pending))
         session.attempts = [ContinuationAttempt(**a) for a in payload["attempts"]]
         return session
+
+
+# ---- 核验报告辅助函数 --------------------------------------------------
+
+def _find_relative_residual(criterion) -> RelativeResidual | None:
+    """递归找出停止条件中实际生效的相对残差容差（支持组合/停滞包装）。"""
+    if isinstance(criterion, RelativeResidual):
+        return criterion
+    inner = getattr(criterion, "inner", None)
+    if inner is not None:
+        found = _find_relative_residual(inner)
+        if found is not None:
+            return found
+    for cond in getattr(criterion, "conditions", ()):
+        found = _find_relative_residual(cond)
+        if found is not None:
+            return found
+    return None
+
+
+def _extract_tolerance(criterion) -> dict:
+    """报告使用的容差设定；非 RelativeResidual 条件时 tol 记为 None。"""
+    rel = _find_relative_residual(criterion)
+    if rel is not None:
+        return {"kind": "relative_residual",
+                "definition": "||b - A x||_2 / ||b||_2 <= tol",
+                "tol": _json_number(rel.tol)}
+    return {"kind": type(criterion).__name__, "tol": None}
+
+
+def _json_number(value):
+    """转为 JSON 安全数值；非有限值（inf/NaN）记为 None。"""
+    value = float(value)
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _verified_node_entry(scheme, node, problem_at, tolerance, criterion_sig):
+    """按节点自身参数独立重算残差并给出核验结论。"""
+    problem = problem_at(node.t)
+    residual = problem.residual_norm(node.x)
+    b_norm = float(np.linalg.norm(problem.b))
+    scale = b_norm if b_norm > 0.0 else 1.0
+    tol = tolerance.get("tol")
+    if tol is not None:
+        threshold = tol * scale
+        relative = residual / scale if scale else residual
+        passed = bool(math.isfinite(residual) and residual <= threshold)
+    else:
+        threshold = None
+        relative = None
+        passed = bool(math.isfinite(residual))
+    return {
+        "index": int(node.index),
+        "t": _json_number(node.t),
+        "origin": node.origin,
+        "iterations": int(node.iterations),
+        "residual": _json_number(residual),
+        "b_norm": _json_number(b_norm),
+        "relative_residual": _json_number(relative) if relative is not None else None,
+        "tolerance": tolerance,
+        "threshold": _json_number(threshold) if threshold is not None else None,
+        "criterion": criterion_sig,
+        "conclusion": "confirmed_pass" if passed else "confirmed_fail",
+    }
+
+
+def _partition_budget(scheme, attempts, t_start):
+    """把某方案的预算消耗拆为起点校正、后续推进、失败尝试三类。"""
+    start_iters = advance_iters = failed_iters = 0
+    for attempt in attempts:
+        if attempt.scheme != scheme.label:
+            continue
+        is_start = attempt.t_from == attempt.t_target == t_start
+        if attempt.converged:
+            if is_start:
+                start_iters += attempt.iterations
+            else:
+                advance_iters += attempt.iterations
+        else:
+            failed_iters += attempt.iterations
+    return start_iters, advance_iters, failed_iters
+
+
+def _stopped_at(scheme, t_start, t_end):
+    """说明方案停在起点（未确认/已确认）、后续节点还是终点。"""
+    if not scheme.nodes:
+        return {"kind": "start_unconfirmed", "t": _json_number(t_start)}
+    t = scheme.nodes[-1].t
+    if scheme.status == "completed" or t == t_end:
+        kind = "end"
+    elif t == t_start:
+        kind = "start"
+    else:
+        kind = "followup"
+    return {"kind": kind, "t": _json_number(t)}
+
+
+def _attempt_entry(attempt: ContinuationAttempt) -> dict:
+    return {
+        "scheme": attempt.scheme,
+        "kind": ("start_confirmation"
+                 if attempt.t_from == attempt.t_target else "advance"),
+        "t_from": _json_number(attempt.t_from),
+        "t_target": _json_number(attempt.t_target),
+        "step": _json_number(attempt.step),
+        "iterations": int(attempt.iterations),
+        "status": attempt.status,
+        "residual": _json_number(attempt.residual),
+        "message": attempt.message,
+    }
+
+
+def _fmt_float(value, digits=6):
+    if value is None:
+        return "n/a"
+    value = float(value)
+    if not math.isfinite(value):
+        return ("inf" if value > 0 else "-inf") if not math.isnan(value) else "nan"
+    return f"{value:.{digits}g}"
+
+
+def _format_report_text(report: dict) -> str:
+    """生成简洁中文文本核验报告。"""
+    lines = []
+    pr = report["parameter_range"]
+    lines.append("节点核验报告 (continuation node verification)")
+    lines.append("参数区间: t_start=%s  t_end=%s" % (
+        _fmt_float(pr["t_start"]), _fmt_float(pr["t_end"])))
+    tol = report["tolerance"]
+    lines.append("容差: %s tol=%s" % (tol["kind"], _fmt_float(tol.get("tol"))))
+    bg = report["budget"]
+    lines.append(
+        "预算: 总额=%d 已用=%d 剩余=%d | 起点校正=%d 后续推进=%d 失败尝试=%d" % (
+            bg["total"], bg["used"], bg["remaining"],
+            bg["start_confirmation"], bg["advances"], bg["failed_attempts"]))
+    for scheme in report["schemes"]:
+        stop = scheme["stopped_at"]
+        lines.append("")
+        lines.append("方案 %s [状态=%s, 停于=%s t=%s]" % (
+            scheme["label"], scheme["status"], stop["kind"],
+            _fmt_float(stop["t"])))
+        bd = scheme["budget"]
+        lines.append("  预算: 起点校正=%d 后续推进=%d 失败尝试=%d 合计=%d" % (
+            bd["start_confirmation"], bd["advances"],
+            bd["failed_attempts"], bd["total"]))
+        if scheme["confirmed_nodes"]:
+            lines.append("  已确认节点:")
+            for node in scheme["confirmed_nodes"]:
+                lines.append(
+                    "    #%d t=%s 来源=%s 消耗=%d 真实残差=%s (相对=%s, 阈值=%s) => %s" % (
+                        node["index"], _fmt_float(node["t"]), node["origin"],
+                        node["iterations"], _fmt_float(node["residual"]),
+                        _fmt_float(node["relative_residual"]),
+                        _fmt_float(node["threshold"]), node["conclusion"]))
+        else:
+            lines.append("  已确认节点: 无")
+        pending = scheme["unconfirmed_start"]
+        if pending is not None:
+            lines.append("  尚未确认的初始猜测: t=%s 来源=%s 真实残差=%s 状态=%s" % (
+                _fmt_float(pending["t"]), pending["origin"],
+                _fmt_float(pending["residual"]), pending["status"]))
+
+    def _dump_attempts(title, attempts):
+        if not attempts:
+            return
+        lines.append("")
+        lines.append(title + ":")
+        for attempt in attempts:
+            lines.append(
+                "  方案=%s 类型=%s %s->%s 步长=%s 消耗=%d 状态=%s 真实残差=%s%s" % (
+                    attempt["scheme"], attempt["kind"],
+                    _fmt_float(attempt["t_from"]), _fmt_float(attempt["t_target"]),
+                    _fmt_float(attempt["step"]), attempt["iterations"],
+                    attempt["status"], _fmt_float(attempt["residual"]),
+                    ("  " + attempt["message"]) if attempt["message"] else ""))
+
+    _dump_attempts("暂停尝试（未计入确认节点）", report["paused_attempts"])
+    _dump_attempts("失败尝试（未计入确认节点）", report["failed_attempts"])
+    return "\n".join(lines) + "\n"
