@@ -354,6 +354,163 @@ class ContinuationSession:
         node = scheme.nodes[node_index]
         return self.problem_at(node.t).residual_norm(node.x)
 
+    # ---- 节点核验报告 -------------------------------------------------
+
+    def _independent_check(self, t: float, x: np.ndarray) -> dict:
+        """按参数 t 的问题独立重算真实残差，并用当前精度条件判定。"""
+        problem = self.problem_at(t)
+        x = np.asarray(x, dtype=float)
+        residual = problem.residual_norm(x)
+        criterion = copy.copy(self.criterion)
+        criterion.max_iter = max(1, int(criterion.max_iter))
+        verified = bool(criterion.check(0, x, problem, residual))
+        entry = {"residual": float(residual), "verified": verified}
+        if hasattr(self.criterion, "tol"):
+            b_norm = float(np.linalg.norm(problem.b))
+            entry["threshold"] = float(self.criterion.tol) * (b_norm if b_norm > 0.0 else 1.0)
+        return entry
+
+    @staticmethod
+    def _attempt_entry(attempt: ContinuationAttempt) -> dict:
+        return {"t_from": attempt.t_from, "t_target": attempt.t_target,
+                "step": attempt.step, "iterations": attempt.iterations,
+                "status": attempt.status, "residual": float(attempt.residual),
+                "message": attempt.message}
+
+    def verification_report(self) -> dict:
+        """生成节点核验报告：确认节点逐一独立复核，预算分类汇总。
+
+        每个已确认节点列出参数值、独立重算的真实残差、使用的容差
+        （停止条件设定与数值阈值）及核验结论；尚未校正成功的初始猜测
+        （pending 起点）与暂停尝试单独列出，不混入确认节点。
+        预算按起点校正、后续推进、失败尝试分别汇总；方案停在起点还是
+        后续节点在 stopped_at 中说明。报告只依赖会话状态，保存恢复后
+        再次导出数值与预算一致。
+        """
+        tolerance = self.criterion.signature()
+        schemes = []
+        for scheme in self.schemes:
+            nodes = []
+            for node in scheme.nodes:
+                check = self._independent_check(node.t, node.x)
+                nodes.append({"index": node.index, "t": node.t,
+                              "iterations": node.iterations,
+                              "origin": node.origin,
+                              "tolerance": tolerance,
+                              "residual": check["residual"],
+                              "threshold": check.get("threshold"),
+                              "verified": check["verified"]})
+            pending = None
+            if scheme.pending is not None:
+                check = self._independent_check(scheme.pending["t"],
+                                                scheme.pending["x"])
+                pending = {"t": scheme.pending["t"],
+                           "origin": scheme.pending["origin"],
+                           "residual": check["residual"],
+                           "threshold": check.get("threshold"),
+                           "verified": check["verified"]}
+            own = [a for a in self.attempts if a.scheme == scheme.label]
+            failed = [a for a in own if not a.converged and a.status != "paused"]
+            paused = [a for a in own if a.status == "paused"]
+            if scheme.pending is not None or len(scheme.nodes) <= 1:
+                stopped_at = "start"
+            else:
+                stopped_at = "node"
+            if scheme.nodes:
+                stopped_t = scheme.nodes[-1].t
+            elif scheme.pending is not None:
+                stopped_t = scheme.pending["t"]
+            else:
+                stopped_t = None
+            schemes.append({
+                "label": scheme.label, "status": scheme.status,
+                "reached_end": scheme.reached_end,
+                "stopped_at": stopped_at, "stopped_t": stopped_t,
+                "confirmed_nodes": nodes,
+                "pending_start": pending,
+                "failed_attempts": [self._attempt_entry(a) for a in failed],
+                "paused_attempts": [self._attempt_entry(a) for a in paused],
+                "budget": self._budget_breakdown(own),
+            })
+        return {"t_start": self.t_start, "t_end": self.t_end,
+                "tolerance": tolerance,
+                "budget_total": self.total_budget,
+                "budget_used": self.budget_used,
+                "budget": self._budget_breakdown(self.attempts),
+                "schemes": schemes}
+
+    @staticmethod
+    def _budget_breakdown(attempts) -> dict:
+        """按起点校正 / 后续推进 / 失败尝试分类汇总迭代消耗。"""
+        start = sum(a.iterations for a in attempts if a.step == 0.0)
+        advance = sum(a.iterations for a in attempts
+                      if a.step != 0.0 and a.converged)
+        failed = sum(a.iterations for a in attempts
+                     if a.step != 0.0 and not a.converged)
+        return {"start_confirmation": int(start), "advancement": int(advance),
+                "failed_attempts": int(failed),
+                "total": int(start + advance + failed)}
+
+    def export_verification_report(self, path=None, fmt: str = "json") -> str:
+        """导出节点核验报告；fmt 为 "json" 或 "text"，可选写入文件。"""
+        report = self.verification_report()
+        if fmt == "json":
+            text = json.dumps(report, indent=2, ensure_ascii=False)
+        elif fmt == "text":
+            text = self._format_verification_text(report)
+        else:
+            raise ValueError("不支持的报告格式：" + str(fmt))
+        if path is not None:
+            Path(path).write_text(text, encoding="utf-8")
+        return text
+
+    @staticmethod
+    def _format_verification_text(report: dict) -> str:
+        lines = []
+        budget = report["budget"]
+        lines.append("节点核验报告  参数区间 [%.6g, %.6g]"
+                     % (report["t_start"], report["t_end"]))
+        lines.append("预算：已用 %d / 总计 %d（起点校正 %d，后续推进 %d，失败尝试 %d）"
+                     % (report["budget_used"], report["budget_total"],
+                        budget["start_confirmation"],
+                        budget["advancement"], budget["failed_attempts"]))
+        for scheme in report["schemes"]:
+            where = "起点" if scheme["stopped_at"] == "start" else "后续节点"
+            lines.append("")
+            lines.append("方案 %s [%s] 停在%s t=%s"
+                         % (scheme["label"], scheme["status"], where,
+                            "%.6g" % scheme["stopped_t"]
+                            if scheme["stopped_t"] is not None else "无"))
+            sb = scheme["budget"]
+            lines.append("  预算：起点校正 %d，后续推进 %d，失败尝试 %d"
+                         % (sb["start_confirmation"], sb["advancement"],
+                            sb["failed_attempts"]))
+            lines.append("  已确认节点：")
+            if not scheme["confirmed_nodes"]:
+                lines.append("    （无）")
+            for node in scheme["confirmed_nodes"]:
+                verdict = "通过" if node["verified"] else "未通过"
+                threshold = (" 阈值=%.3e" % node["threshold"]
+                             if node.get("threshold") is not None else "")
+                lines.append("    #%d t=%.6g 残差=%.3e%s 结论=%s 来源=%s"
+                             % (node["index"], node["t"], node["residual"],
+                                threshold, verdict, node["origin"]))
+            pending = scheme["pending_start"]
+            if pending is not None:
+                lines.append("  待确认起点：t=%.6g 残差=%.3e 来源=%s"
+                             % (pending["t"], pending["residual"],
+                                pending["origin"]))
+            for title, key in (("失败尝试", "failed_attempts"),
+                               ("暂停尝试", "paused_attempts")):
+                if scheme[key]:
+                    lines.append("  %s：" % title)
+                    for a in scheme[key]:
+                        lines.append("    t=%.6g -> %.6g 迭代=%d 状态=%s 残差=%.3e"
+                                     % (a["t_from"], a["t_target"],
+                                        a["iterations"], a["status"],
+                                        a["residual"]))
+        return "\n".join(lines) + "\n"
+
     # ---- 暂停 / 重开 ---------------------------------------------------
 
     def _identity(self) -> dict:
