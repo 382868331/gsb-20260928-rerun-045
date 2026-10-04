@@ -9,6 +9,7 @@ from numexp import (ConjugateGradient, Richardson, RelativeResidual,
                     PreconditionError, TerminationReason, LinearSystem)
 from numexp import (StagnationGuard, assess_reuse, solve_problem_series,
                     StartPath, MultiStartSession)
+from numexp import ContinuationSession
 from numexp.reference import (direct_solve, spd_1d_poisson,
                               spd_sparse_laplacian, nonsymmetric_system,
                               indefinite_system)
@@ -452,7 +453,7 @@ def test_continuation_backtracks_and_reaches_end():
         if not later:
             assert attempt.t_target not in node_ts
     # 每个已确认节点按当前参数重算真实残差都满足精度
-    for node in scheme.nodes[1:]:
+    for node in scheme.nodes:
         problem = _continuation_family(node.t)
         assert problem.residual_norm(node.x) <= 1e-4 * np.linalg.norm(problem.b) * 1.05
     # 终点解可独立验证
@@ -528,3 +529,109 @@ def test_continuation_fork_and_compare_at_same_parameter(tmp_path):
     for entry in finals:
         assert entry["residual"] < 1e-3
 
+
+def test_continuation_invalid_seven_dimensional_start_is_corrected_in_budget():
+    n = 7
+    target_residual = 11.83
+
+    def family(t):
+        return LinearSystem(np.eye(n), np.full(n, target_residual / np.sqrt(n)))
+
+    session = ContinuationSession(
+        family, 0.0, 1.0, lambda c: ConjugateGradient(c),
+        total_budget=1, criterion=RelativeResidual(tol=1e-10),
+        x0=np.zeros(n))
+    result = session.run()
+    attempt = result.attempts[0]
+    root = result.schemes[0].nodes[0]
+
+    assert attempt.t_target == 0.0
+    assert attempt.converged
+    assert attempt.initial_residual == pytest.approx(target_residual, rel=1e-12)
+    assert attempt.residual == pytest.approx(0.0, abs=1e-14)
+    assert root.t == 0.0
+    assert root.iterations == 1
+    assert result.budget_used == 1
+    assert family(0.0).residual_norm(root.x) <= 1e-10
+
+
+def test_continuation_valid_start_costs_zero_and_is_independently_confirmed():
+    n = 3
+    problem = LinearSystem(np.eye(n), np.ones(n))
+    session = ContinuationSession(
+        lambda t: problem, 0.0, 1.0, lambda c: ConjugateGradient(c),
+        total_budget=5, criterion=RelativeResidual(tol=1e-10),
+        x0=np.ones(n))
+    result = session.run()
+    root = result.schemes[0].nodes[0]
+
+    assert root.t == 0.0 and root.iterations == 0
+    assert result.budget_used == sum(a.iterations for a in result.attempts)
+    assert problem.residual_norm(root.x) == pytest.approx(0.0, abs=1e-14)
+
+
+def test_continuation_degenerate_start_fails_without_node_or_continuation():
+    def family(t):
+        if t == 0.0:
+            return LinearSystem(np.array([[1.0, 1.0], [0.0, 1.0]]), np.ones(2))
+        return LinearSystem(np.eye(2), np.ones(2))
+
+    session = ContinuationSession(
+        family, 0.0, 1.0, lambda c: ConjugateGradient(c),
+        total_budget=10, criterion=RelativeResidual(tol=1e-10))
+    result = session.run()
+    scheme = result.schemes[0]
+
+    assert scheme.status == "start_failed"
+    assert scheme.nodes == []
+    assert not scheme.reached_end
+    assert result.attempts[0].status == "precondition_failed"
+    assert result.attempts[0].residual == pytest.approx(np.sqrt(2.0))
+    assert result.budget_used == 0
+    assert session.compare_at(1.0) == []
+
+
+def test_continuation_start_budget_exhaustion_can_resume_without_rechecking_node(tmp_path):
+    n = 4
+    problem = LinearSystem(np.eye(n), np.ones(n))
+    session_dir = tmp_path / "sess"
+    session = ContinuationSession(
+        lambda t: problem, 0.0, 1.0,
+        lambda c: Richardson(0.5, c), total_budget=1,
+        criterion=RelativeResidual(tol=1e-10),
+        session_dir=session_dir)
+    result = session.run()
+    scheme = result.schemes[0]
+
+    assert scheme.status == "paused"
+    assert scheme.nodes == []
+    assert result.budget_used == 1
+    assert result.attempts[0].status == "budget_exhausted"
+
+    resumed = ContinuationSession.load(
+        session_dir, lambda t: problem, lambda c: Richardson(0.5, c),
+        RelativeResidual(tol=1e-10))
+    assert resumed.budget_used == 1
+    resumed_result = resumed.run(extra_budget=100)
+    root = resumed_result.schemes[0].nodes[0]
+    start_attempts = [a for a in resumed_result.attempts if a.t_target == 0.0]
+
+    assert len(start_attempts) == 2
+    assert start_attempts[0].status == "budget_exhausted"
+    assert start_attempts[1].converged
+    assert resumed_result.budget_used == 1 + start_attempts[1].iterations
+    assert problem.residual_norm(root.x) <= 1e-10 * np.linalg.norm(problem.b)
+
+
+def test_continuation_saved_nodes_are_reverified_on_load(tmp_path):
+    session = _make_continuation(tmp_path, budget=3000,
+                                 session_dir=str(tmp_path / "sess"))
+    session.run()
+    resumed = ContinuationSession.load(
+        tmp_path / "sess", _continuation_family,
+        lambda c: ConjugateGradient(c),
+        RelativeResidual(tol=1e-4))
+    for scheme in resumed.schemes:
+        for node in scheme.nodes:
+            problem = _continuation_family(node.t)
+            assert problem.residual_norm(node.x) <= 1e-4 * np.linalg.norm(problem.b)

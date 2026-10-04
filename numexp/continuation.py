@@ -3,7 +3,8 @@
 设计要点：
 
 * 参数跟踪：用户给出参数起点 t_start 与终点 t_end 以及问题族
-  problem_at(t)；每条方案（scheme）从已确认节点出发，以上一节点
+  problem_at(t)；起点 x0 也必须先在 t_start 处满足节点方程与精度，
+  修正起点所耗迭代从统一预算扣减。每条方案（scheme）从已确认节点出发，以上一节点
   的解作为热启动推进到下一个参数值，沿途记录解的变化。
 * 失败回退：某一步未收敛（预算上限内未达精度、数值异常、前提拒绝）
   时，记录这次失败尝试及其实际消耗，然后缩小步长，从上一个已确认
@@ -31,7 +32,7 @@ from .criteria import RelativeResidual, StoppingCriterion
 from .problems import LinearSystem, PreconditionError
 from .records import TerminationReason
 
-SESSION_VERSION = 1
+SESSION_VERSION = 2
 
 
 @dataclass
@@ -54,9 +55,10 @@ class ContinuationAttempt:
     t_target: float
     step: float
     iterations: int                   # 本次尝试实际消耗的迭代步数
-    status: str                       # converged / 失败原因 / paused
+    status: str                       # converged / budget_exhausted / 其他失败原因
     residual: float                   # 尝试结束时的真实残差（失败仅记录）
     message: str = ""
+    initial_residual: float | None = None  # 起点核验时的未修正初值残差
 
     @property
     def converged(self) -> bool:
@@ -71,10 +73,12 @@ class ContinuationScheme:
     t_end: float
     nodes: list = field(default_factory=list)
     step: float = 0.0                 # 下一步将尝试的步长
-    status: str = "active"            # active / completed / stalled / paused
+    status: str = "active"            # active / completed / stalled / paused / start_failed
 
     @property
     def current(self) -> ContinuationNode:
+        if not self.nodes:
+            raise IndexError("起点尚未确认，没有当前节点")
         return self.nodes[-1]
 
     @property
@@ -151,11 +155,10 @@ class ContinuationSession:
         self.max_step_iters = max_step_iters
         self.session_dir = Path(session_dir) if session_dir else None
         self.attempts: list = []
-        start_x = np.zeros(problem_at(self.t_start).n) if x0 is None else np.asarray(x0, dtype=float)
-        root = ContinuationNode(index=0, t=self.t_start, x=start_x,
-                                iterations=0, origin="fresh")
+        self.start_x = (np.zeros(problem_at(self.t_start).n) if x0 is None
+                        else np.asarray(x0, dtype=float))
         self.schemes = [ContinuationScheme(label="main", t_end=self.t_end,
-                                           nodes=[root], step=self.initial_step)]
+                                           nodes=[], step=self.initial_step)]
 
     # ---- 预算 ---------------------------------------------------------
 
@@ -174,6 +177,9 @@ class ContinuationSession:
         if not 0 <= node_index < len(source.nodes):
             raise IndexError("节点序号越界：" + str(node_index))
         anchor = source.nodes[node_index]
+        problem = self.problem_at(anchor.t)
+        if not self._satisfies(problem, anchor.x):
+            raise ValueError("源节点未通过当前参数处的精度复核，不能 fork")
         root = ContinuationNode(index=0, t=anchor.t, x=np.array(anchor.x, copy=True),
                                 iterations=0,
                                 origin="fork:" + source.label + "#node" + str(node_index))
@@ -206,21 +212,17 @@ class ContinuationSession:
         return self.result()
 
     def _advance(self, scheme: ContinuationScheme) -> None:
+        if not scheme.nodes:
+            self._confirm_start(scheme)
+            return
         node = scheme.current
         if node.t == self.t_end:
             scheme.status = "completed"
             return
         step = min(scheme.step, self.t_end - node.t)
         t_target = node.t + step
-        allowed = self.remaining_budget
-        if self.max_step_iters is not None:
-            allowed = min(allowed, self.max_step_iters)
-        if allowed <= 0:
-            scheme.status = "paused"
-            return
         problem = self.problem_at(t_target)
-        criterion = copy.copy(self.criterion)
-        criterion.max_iter = allowed
+        criterion = self._criterion_for_attempt()
         try:
             solver = self.make_solver(criterion)
             outcome = solver.solve(problem, x0=node.x)
@@ -229,20 +231,26 @@ class ContinuationSession:
             residual = problem.residual_norm(outcome.x)
             message = outcome.message
             success = outcome.success
+            x = outcome.x
         except PreconditionError as exc:
-            iterations, residual, message = 0, np.inf, str(exc)
+            iterations = 0
+            x = node.x.copy()
+            residual = problem.residual_norm(x)
+            message = str(exc)
             status = TerminationReason.PRECONDITION_FAILED.value
             success = False
         self.budget_used += iterations
         pool_empty = self.remaining_budget <= 0
-        if not success and pool_empty:
-            # 预算池在本次尝试中耗尽：标记暂停，追加预算后从已确认节点重试
-            status = "paused"
+        accepted = success and self._satisfies(problem, x, criterion)
+        if not accepted and success:
+            status = "verification_failed"
+            message = "求解器报告成功，但节点残差未通过独立精度复核"
+        paused = not accepted and not success and pool_empty
         self.attempts.append(ContinuationAttempt(
             scheme=scheme.label, t_from=node.t, t_target=t_target, step=step,
             iterations=iterations, status=status, residual=residual,
             message=message))
-        if success:
+        if accepted:
             scheme.nodes.append(ContinuationNode(
                 index=len(scheme.nodes), t=t_target, x=outcome.x,
                 iterations=iterations,
@@ -250,7 +258,7 @@ class ContinuationSession:
             scheme.step = min(step * 1.5, self.t_end - self.t_start)
             if t_target == self.t_end:
                 scheme.status = "completed"
-        elif status == "paused":
+        elif paused:
             scheme.status = "paused"
         else:
             # 失败回退：缩小步长，从上一个已确认节点重新出发；
@@ -258,6 +266,72 @@ class ContinuationSession:
             scheme.step = step * 0.5
             if scheme.step < self.min_step:
                 scheme.status = "stalled"
+
+    def _confirm_start(self, scheme: ContinuationScheme) -> None:
+        """在 t_start 处求解或核验用户初值；未确认前不创建任何节点。"""
+        problem = self.problem_at(self.t_start)
+        initial_residual = problem.residual_norm(self.start_x)
+        criterion = self._criterion_for_attempt(limit_by_step=False)
+        try:
+            solver = self.make_solver(criterion)
+            outcome = solver.solve(problem, x0=self.start_x)
+            iterations = outcome.iterations
+            status = outcome.reason.value
+            residual = problem.residual_norm(outcome.x)
+            message = outcome.message
+            success = outcome.success
+            x = outcome.x
+        except PreconditionError as exc:
+            iterations = 0
+            residual = initial_residual
+            message = str(exc)
+            status = TerminationReason.PRECONDITION_FAILED.value
+            success = False
+            x = self.start_x
+        self.budget_used += iterations
+        pool_empty = self.remaining_budget <= 0
+        accepted = success and self._satisfies(problem, x, criterion)
+        if not accepted and success:
+            status = "verification_failed"
+            message = "求解器报告成功，但起点残差未通过独立精度复核"
+        paused = not accepted and not success and pool_empty
+        self.attempts.append(ContinuationAttempt(
+            scheme=scheme.label, t_from=self.t_start, t_target=self.t_start,
+            step=0.0, iterations=iterations, status=status,
+            residual=residual, message=message,
+            initial_residual=initial_residual))
+        if accepted:
+            scheme.nodes.append(ContinuationNode(
+                index=0, t=self.t_start, x=x, iterations=iterations,
+                origin="fresh"))
+        elif paused:
+            scheme.status = "paused"
+        else:
+            scheme.status = "start_failed"
+
+    def _criterion_for_attempt(self, limit_by_step: bool = True):
+        allowed = self.remaining_budget
+        if limit_by_step and self.max_step_iters is not None:
+            allowed = min(allowed, self.max_step_iters)
+        criterion = copy.copy(self.criterion)
+        criterion.max_iter = max(0, allowed)
+        return criterion
+
+    def _satisfies(self, problem, x, criterion: StoppingCriterion | None = None) -> bool:
+        criterion = copy.deepcopy(criterion or self.criterion)
+        residual = problem.residual_norm(x)
+        return bool(np.isfinite(residual)
+                    and criterion.check(0, np.asarray(x, dtype=float), problem, residual))
+
+    def _verified_nodes(self) -> None:
+        for scheme in self.schemes:
+            for node in scheme.nodes:
+                problem = self.problem_at(node.t)
+                if not self._satisfies(problem, node.x):
+                    residual = problem.residual_norm(node.x)
+                    raise ValueError(
+                        f"方案 {scheme.label} 的节点 t={node.t} 未通过当前问题残差复核："
+                        f"residual={residual:.6e}")
 
     # ---- 查询 ---------------------------------------------------------
 
@@ -293,14 +367,17 @@ class ContinuationSession:
     def _identity(self) -> dict:
         return {"t_start": self.t_start, "t_end": self.t_end,
                 "start_problem": self.problem_at(self.t_start).identity(),
-                "end_problem": self.problem_at(self.t_end).identity()}
+                "end_problem": self.problem_at(self.t_end).identity(),
+                "criterion": self.criterion.signature()}
 
     def save(self) -> None:
         """持久化各方案的已确认节点、预算消耗与全部尝试记录。"""
         if self.session_dir is None:
             raise ValueError("未设置 session_dir，无法保存会话")
+        self._verified_nodes()
         self.session_dir.mkdir(parents=True, exist_ok=True)
         arrays = {}
+        arrays["start_main"] = np.asarray(self.start_x, dtype=float)
         for s_idx, scheme in enumerate(self.schemes):
             for node in scheme.nodes:
                 arrays["x_%d_%d" % (s_idx, node.index)] = np.asarray(node.x, dtype=float)
@@ -322,7 +399,8 @@ class ContinuationSession:
             "attempts": [
                 {"scheme": a.scheme, "t_from": a.t_from, "t_target": a.t_target,
                  "step": a.step, "iterations": a.iterations, "status": a.status,
-                 "residual": a.residual, "message": a.message}
+                 "residual": a.residual, "message": a.message,
+                 "initial_residual": a.initial_residual}
                 for a in self.attempts
             ],
         }
@@ -350,6 +428,7 @@ class ContinuationSession:
         if payload.get("version") != SESSION_VERSION:
             raise ValueError("会话记录格式不受支持")
         identity = payload["identity"]
+        criterion = criterion or RelativeResidual()
         session = cls(problem_at, identity["t_start"], identity["t_end"],
                       make_solver, total_budget=payload["total_budget"],
                       criterion=criterion,
@@ -374,5 +453,9 @@ class ContinuationSession:
                 label=item["label"], t_end=session.t_end, nodes=nodes,
                 step=item["step"], status=item["status"]))
         session.attempts = [ContinuationAttempt(**a) for a in payload["attempts"]]
+        if "start_main" in arrays:
+            session.start_x = arrays["start_main"]
+        if identity.get("criterion") != criterion.signature():
+            raise ValueError("会话记录的停止条件与当前不一致，不能恢复")
+        session._verified_nodes()
         return session
-
