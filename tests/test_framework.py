@@ -528,3 +528,103 @@ def test_continuation_fork_and_compare_at_same_parameter(tmp_path):
     for entry in finals:
         assert entry["residual"] < 1e-3
 
+
+def test_continuation_start_requires_actual_solve():
+    """起点不直接算已确认：首次运行按 t_start 处问题求解验证。"""
+    from numexp import ContinuationSession
+    # 独立七维线性族：零初值在 t=0 处真实残差 ||b|| = sqrt(140) ≈ 11.83
+    def family(t):
+        n = 7
+        b = 1.0 + np.arange(n)
+        diag = 2.0 + np.arange(n) + t
+        A = np.diag(diag) + 0.1 * t * (np.ones((n, n)) - np.eye(n))
+        return LinearSystem(A, b)
+    # 无效初值：零向量残差大，单步预算内无法收敛
+    session = ContinuationSession(family, 0.0, 1.0,
+                                  lambda c: ConjugateGradient(c),
+                                  total_budget=3000,
+                                  criterion=RelativeResidual(tol=1e-4),
+                                  initial_step=0.5, min_step=1e-3,
+                                  max_step_iters=2)
+    assert session.schemes[0].nodes == []  # 构造时不确认
+    result = session.run()
+    scheme = result.schemes[0]
+    start_attempts = [a for a in result.attempts
+                      if a.t_from == 0.0 and a.t_target == 0.0]
+    assert start_attempts, "起点确认必须实际求解并记录尝试"
+    first = start_attempts[0]
+    assert not first.converged
+    assert first.residual > 1e-4 * np.linalg.norm(1.0 + np.arange(7))
+    # 起点未确认：不列节点、不算到达、final_solution 为 None
+    assert all(n.t != 0.0 for n in scheme.nodes)
+    assert session.final_solution("main") is None
+    # 确认消耗计入统一预算
+    assert result.budget_used >= first.iterations > 0
+
+
+def test_continuation_start_valid_x0_confirmed_at_start_problem():
+    """有效初值：满足 t_start 方程与精度即确认，残差可按自身参数重算。"""
+    session = _make_continuation()
+    result = session.run()
+    scheme = result.schemes[0]
+    root = scheme.nodes[0]
+    assert root.t == 0.0
+    problem0 = _continuation_family(0.0)
+    assert problem0.residual_norm(root.x) <= 1e-4 * np.linalg.norm(problem0.b) * 1.05
+    # verify_node 按节点自身参数重算残差
+    for idx in range(len(scheme.nodes)):
+        node = scheme.nodes[idx]
+        expected = _continuation_family(node.t).residual_norm(node.x)
+        assert session.verify_node("main", idx) == pytest.approx(expected)
+
+
+def test_continuation_start_degenerate_exact_x0_zero_cost():
+    """退化情形：x0 已是精确解，确认零消耗且仍记录一次尝试。"""
+    session = _make_continuation()  # x0 为 t=0 处精确解
+    result = session.run()
+    start_attempts = [a for a in result.attempts
+                      if a.t_from == 0.0 and a.t_target == 0.0]
+    assert len(start_attempts) == 1
+    assert start_attempts[0].converged
+    assert start_attempts[0].iterations == 0
+    assert result.schemes[0].nodes[0].iterations == 0
+
+
+def test_continuation_start_confirmation_budget_pause_resume(tmp_path):
+    """预算不足：起点确认标记待续，重开后不跳验证也不重复扣减。"""
+    from numexp import ContinuationSession
+    def family(t):
+        n = 7
+        b = 1.0 + np.arange(n)
+        diag = 2.0 + np.arange(n) + t
+        A = np.diag(diag) + 0.1 * t * (np.ones((n, n)) - np.eye(n))
+        return LinearSystem(A, b)
+    kwargs = dict(criterion=RelativeResidual(tol=1e-12),
+                  initial_step=0.5, min_step=1e-3, max_step_iters=10,
+                  session_dir=str(tmp_path / "sess"))
+    session = ContinuationSession(family, 0.0, 1.0,
+                                  lambda c: ConjugateGradient(c),
+                                  total_budget=3, **kwargs)
+    result = session.run()
+    scheme = result.schemes[0]
+    assert scheme.status == "paused"
+    assert not scheme.nodes
+    used_before = result.budget_used
+    assert used_before == 3
+    # 暂停重开：待确认起点保留，追加预算后续验，不重复扣减
+    resumed = ContinuationSession.load(tmp_path / "sess", family,
+                                       lambda c: ConjugateGradient(c),
+                                       criterion=RelativeResidual(tol=1e-12))
+    assert resumed.schemes[0].pending is not None
+    assert resumed.budget_used == used_before
+    result2 = resumed.run(extra_budget=3000)
+    scheme2 = result2.schemes[0]
+    assert scheme2.nodes and scheme2.nodes[0].t == 0.0
+    assert scheme2.pending is None
+    # 预算账目一致：总消耗等于全部尝试之和，且不重扣首次确认
+    assert result2.budget_used == sum(a.iterations for a in result2.attempts)
+    start_attempts = [a for a in result2.attempts
+                      if a.t_from == 0.0 and a.t_target == 0.0]
+    assert sum(a.iterations for a in start_attempts) + \
+        sum(a.iterations for a in result2.attempts
+            if not (a.t_from == 0.0 and a.t_target == 0.0)) == result2.budget_used

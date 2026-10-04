@@ -16,6 +16,10 @@
   比较不同方案在同一参数处的解。
 * 未完成不替代：方案只有确认到达 t_end 才算完成；
   solution_at(t) 在没有确认节点时返回 None，不以最近结果代替。
+* 起点需确认：参数起点 t_start 处的初始解不直接算作已确认节点；
+  首次运行时按 problem_at(t_start) 实际求解验证，消耗计入统一预算，
+  只有达到精度才成为已确认节点；未确认的起点在暂停重开后仍需验证，
+  不会因保存接续而跳过验证或重复扣减。
 """
 
 from __future__ import annotations
@@ -72,9 +76,12 @@ class ContinuationScheme:
     nodes: list = field(default_factory=list)
     step: float = 0.0                 # 下一步将尝试的步长
     status: str = "active"            # active / completed / stalled / paused
+    pending: dict | None = None       # 待确认起点 {"t", "x", "origin"}；None 表示已确认
 
     @property
     def current(self) -> ContinuationNode:
+        if not self.nodes:
+            raise ValueError("方案 " + self.label + " 的起点尚未确认，没有当前节点")
         return self.nodes[-1]
 
     @property
@@ -152,10 +159,12 @@ class ContinuationSession:
         self.session_dir = Path(session_dir) if session_dir else None
         self.attempts: list = []
         start_x = np.zeros(problem_at(self.t_start).n) if x0 is None else np.asarray(x0, dtype=float)
-        root = ContinuationNode(index=0, t=self.t_start, x=start_x,
-                                iterations=0, origin="fresh")
+        # 起点只是待确认初值：首次运行时按 t_start 处的问题实际求解，
+        # 达到精度才列为已确认节点；求解消耗计入统一预算。
+        pending = {"t": self.t_start, "x": start_x, "origin": "fresh"}
         self.schemes = [ContinuationScheme(label="main", t_end=self.t_end,
-                                           nodes=[root], step=self.initial_step)]
+                                           nodes=[], step=self.initial_step,
+                                           pending=pending)]
 
     # ---- 预算 ---------------------------------------------------------
 
@@ -206,6 +215,9 @@ class ContinuationSession:
         return self.result()
 
     def _advance(self, scheme: ContinuationScheme) -> None:
+        if scheme.pending is not None:
+            self._confirm_start(scheme)
+            return
         node = scheme.current
         if node.t == self.t_end:
             scheme.status = "completed"
@@ -259,6 +271,52 @@ class ContinuationSession:
             if scheme.step < self.min_step:
                 scheme.status = "stalled"
 
+    def _confirm_start(self, scheme: ContinuationScheme) -> None:
+        """求解 t_start 处的问题以确认起点；只有达到精度才列为已确认节点。
+
+        消耗计入统一预算并记录尝试；预算不足标记 paused（追加预算后续验），
+        其余失败标记 stalled，失败依据保留在 attempts 日志中。
+        """
+        pending = scheme.pending
+        t = pending["t"]
+        allowed = self.remaining_budget
+        if self.max_step_iters is not None:
+            allowed = min(allowed, self.max_step_iters)
+        if allowed <= 0:
+            scheme.status = "paused"
+            return
+        problem = self.problem_at(t)
+        criterion = copy.copy(self.criterion)
+        criterion.max_iter = allowed
+        try:
+            solver = self.make_solver(criterion)
+            outcome = solver.solve(problem, x0=pending["x"])
+            iterations = outcome.iterations
+            status = outcome.reason.value
+            residual = problem.residual_norm(outcome.x)
+            message = outcome.message
+            success = outcome.success
+        except PreconditionError as exc:
+            iterations, residual, message = 0, np.inf, str(exc)
+            status = TerminationReason.PRECONDITION_FAILED.value
+            success = False
+        self.budget_used += iterations
+        if not success and self.remaining_budget <= 0:
+            status = "paused"
+        self.attempts.append(ContinuationAttempt(
+            scheme=scheme.label, t_from=t, t_target=t, step=0.0,
+            iterations=iterations, status=status, residual=residual,
+            message=message))
+        if success:
+            scheme.nodes.append(ContinuationNode(
+                index=0, t=t, x=outcome.x, iterations=iterations,
+                origin=pending["origin"]))
+            scheme.pending = None
+        elif status == "paused":
+            scheme.status = "paused"
+        else:
+            scheme.status = "stalled"
+
     # ---- 查询 ---------------------------------------------------------
 
     def result(self) -> ContinuationResult:
@@ -288,6 +346,14 @@ class ContinuationSession:
         scheme = self._scheme(label)
         return scheme.solution_at(self.t_end)
 
+    def verify_node(self, label: str, node_index: int) -> float:
+        """按节点自身参数重算真实残差，独立复核该确认节点。"""
+        scheme = self._scheme(label)
+        if not 0 <= node_index < len(scheme.nodes):
+            raise IndexError("节点序号越界：" + str(node_index))
+        node = scheme.nodes[node_index]
+        return self.problem_at(node.t).residual_norm(node.x)
+
     # ---- 暂停 / 重开 ---------------------------------------------------
 
     def _identity(self) -> dict:
@@ -304,6 +370,8 @@ class ContinuationSession:
         for s_idx, scheme in enumerate(self.schemes):
             for node in scheme.nodes:
                 arrays["x_%d_%d" % (s_idx, node.index)] = np.asarray(node.x, dtype=float)
+            if scheme.pending is not None:
+                arrays["pending_%d" % s_idx] = np.asarray(scheme.pending["x"], dtype=float)
         payload = {
             "version": SESSION_VERSION,
             "identity": self._identity(),
@@ -314,6 +382,8 @@ class ContinuationSession:
             "max_step_iters": self.max_step_iters,
             "schemes": [
                 {"label": s.label, "step": s.step, "status": s.status,
+                 "pending": (None if s.pending is None else
+                             {"t": s.pending["t"], "origin": s.pending["origin"]}),
                  "nodes": [{"index": n.index, "t": n.t,
                             "iterations": n.iterations, "origin": n.origin}
                            for n in s.nodes]}
@@ -370,9 +440,14 @@ class ContinuationSession:
                                       iterations=n["iterations"],
                                       origin=n["origin"])
                      for n in item["nodes"]]
+            pending_info = item.get("pending")
+            pending = None
+            if pending_info is not None:
+                pending = {"t": pending_info["t"],
+                           "x": arrays["pending_%d" % s_idx],
+                           "origin": pending_info["origin"]}
             session.schemes.append(ContinuationScheme(
                 label=item["label"], t_end=session.t_end, nodes=nodes,
-                step=item["step"], status=item["status"]))
+                step=item["step"], status=item["status"], pending=pending))
         session.attempts = [ContinuationAttempt(**a) for a in payload["attempts"]]
         return session
-
