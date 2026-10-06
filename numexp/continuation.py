@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +37,37 @@ from .problems import LinearSystem, PreconditionError
 from .records import TerminationReason
 
 SESSION_VERSION = 1
+
+# 非有限诊断量（NaN / ±Infinity）在 JSON 中的明确可交换表示：
+# 用字符串标记代替非法字面量，既不伪装成零也不丢失失败信息。
+_NONFINITE_LABELS = {"Infinity": math.inf, "-Infinity": -math.inf, "NaN": math.nan}
+
+
+def _json_number(value):
+    """有限浮点原样返回；非有限值返回明确字符串标记，保证严格合法 JSON。"""
+    v = float(value)
+    if math.isnan(v):
+        return "NaN"
+    if math.isinf(v):
+        return "Infinity" if v > 0 else "-Infinity"
+    return v
+
+
+def _parse_number(value):
+    """把 _json_number 的字符串标记还原为浮点，用于会话恢复。"""
+    if isinstance(value, str):
+        try:
+            return _NONFINITE_LABELS[value]
+        except KeyError:
+            raise ValueError("无法识别的非有限数值标记：" + value)
+    return float(value)
+
+
+def _format_number(value):
+    """文本报告中的数值显示：非有限标记与 JSON 表示保持一致。"""
+    if isinstance(value, str):
+        return value
+    return "%.3e" % value
 
 
 @dataclass
@@ -364,17 +396,18 @@ class ContinuationSession:
         criterion = copy.copy(self.criterion)
         criterion.max_iter = max(1, int(criterion.max_iter))
         verified = bool(criterion.check(0, x, problem, residual))
-        entry = {"residual": float(residual), "verified": verified}
+        entry = {"residual": _json_number(residual), "verified": verified}
         if hasattr(self.criterion, "tol"):
             b_norm = float(np.linalg.norm(problem.b))
-            entry["threshold"] = float(self.criterion.tol) * (b_norm if b_norm > 0.0 else 1.0)
+            entry["threshold"] = _json_number(
+                float(self.criterion.tol) * (b_norm if b_norm > 0.0 else 1.0))
         return entry
 
     @staticmethod
     def _attempt_entry(attempt: ContinuationAttempt) -> dict:
         return {"t_from": attempt.t_from, "t_target": attempt.t_target,
                 "step": attempt.step, "iterations": attempt.iterations,
-                "status": attempt.status, "residual": float(attempt.residual),
+                "status": attempt.status, "residual": _json_number(attempt.residual),
                 "message": attempt.message}
 
     def verification_report(self) -> dict:
@@ -455,7 +488,8 @@ class ContinuationSession:
         """导出节点核验报告；fmt 为 "json" 或 "text"，可选写入文件。"""
         report = self.verification_report()
         if fmt == "json":
-            text = json.dumps(report, indent=2, ensure_ascii=False)
+            text = json.dumps(report, indent=2, ensure_ascii=False,
+                              allow_nan=False)
         elif fmt == "text":
             text = self._format_verification_text(report)
         else:
@@ -490,25 +524,26 @@ class ContinuationSession:
                 lines.append("    （无）")
             for node in scheme["confirmed_nodes"]:
                 verdict = "通过" if node["verified"] else "未通过"
-                threshold = (" 阈值=%.3e" % node["threshold"]
+                threshold = (" 阈值=" + _format_number(node["threshold"])
                              if node.get("threshold") is not None else "")
-                lines.append("    #%d t=%.6g 残差=%.3e%s 结论=%s 来源=%s"
-                             % (node["index"], node["t"], node["residual"],
+                lines.append("    #%d t=%.6g 残差=%s%s 结论=%s 来源=%s"
+                             % (node["index"], node["t"],
+                                _format_number(node["residual"]),
                                 threshold, verdict, node["origin"]))
             pending = scheme["pending_start"]
             if pending is not None:
-                lines.append("  待确认起点：t=%.6g 残差=%.3e 来源=%s"
-                             % (pending["t"], pending["residual"],
+                lines.append("  待确认起点：t=%.6g 残差=%s 来源=%s"
+                             % (pending["t"], _format_number(pending["residual"]),
                                 pending["origin"]))
             for title, key in (("失败尝试", "failed_attempts"),
                                ("暂停尝试", "paused_attempts")):
                 if scheme[key]:
                     lines.append("  %s：" % title)
                     for a in scheme[key]:
-                        lines.append("    t=%.6g -> %.6g 迭代=%d 状态=%s 残差=%.3e"
+                        lines.append("    t=%.6g -> %.6g 迭代=%d 状态=%s 残差=%s"
                                      % (a["t_from"], a["t_target"],
                                         a["iterations"], a["status"],
-                                        a["residual"]))
+                                        _format_number(a["residual"])))
         return "\n".join(lines) + "\n"
 
     # ---- 暂停 / 重开 ---------------------------------------------------
@@ -549,14 +584,15 @@ class ContinuationSession:
             "attempts": [
                 {"scheme": a.scheme, "t_from": a.t_from, "t_target": a.t_target,
                  "step": a.step, "iterations": a.iterations, "status": a.status,
-                 "residual": a.residual, "message": a.message}
+                 "residual": _json_number(a.residual), "message": a.message}
                 for a in self.attempts
             ],
         }
         tmp_npz = self.session_dir / ".continuation.writing.npz"
         tmp_json = self.session_dir / "continuation.json.tmp"
         np.savez(tmp_npz, **arrays)
-        tmp_json.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_json.write_text(json.dumps(payload, allow_nan=False),
+                            encoding="utf-8")
         tmp_npz.replace(self.session_dir / "continuation.npz")
         tmp_json.replace(self.session_dir / "continuation.json")
 
@@ -606,5 +642,10 @@ class ContinuationSession:
             session.schemes.append(ContinuationScheme(
                 label=item["label"], t_end=session.t_end, nodes=nodes,
                 step=item["step"], status=item["status"], pending=pending))
-        session.attempts = [ContinuationAttempt(**a) for a in payload["attempts"]]
+        session.attempts = [
+            ContinuationAttempt(
+                scheme=a["scheme"], t_from=a["t_from"], t_target=a["t_target"],
+                step=a["step"], iterations=a["iterations"], status=a["status"],
+                residual=_parse_number(a["residual"]), message=a["message"])
+            for a in payload["attempts"]]
         return session

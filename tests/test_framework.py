@@ -750,3 +750,126 @@ def test_verification_report_singular_system():
     assert failed and failed[0]["status"] == "precondition_failed"
     assert failed[0]["iterations"] == 0
     assert report["budget_used"] == 0
+
+
+def _strict_json_loads(text):
+    """严格 JSON 解析：拒绝 Infinity/NaN 等非标准常量。"""
+    def reject(value):
+        raise ValueError("非标准 JSON 常量：" + value)
+    return json.loads(text, parse_constant=reject)
+
+
+def _nonfinite_report_scenarios():
+    """奇异矩阵（前提拒绝）与数值崩溃（发散）两种产生非有限残差的会话。"""
+    from numexp import ContinuationSession
+
+    def singular_family(t):
+        if t >= 0.5:
+            return LinearSystem(np.ones((4, 4)), np.ones(4))  # 奇异矩阵
+        return LinearSystem(np.diag(1.0 + np.arange(4)), np.ones(4))
+
+    singular = ContinuationSession(singular_family, 0.0, 1.0,
+                                   lambda c: ConjugateGradient(c),
+                                   total_budget=3000,
+                                   criterion=RelativeResidual(tol=1e-4),
+                                   initial_step=0.5, min_step=1e-3)
+
+    def divergent_family(t):
+        if t >= 0.5:
+            return LinearSystem(4.0 * np.eye(4), np.ones(4))  # Richardson 发散
+        return LinearSystem(0.5 * np.eye(4), np.ones(4))
+
+    breakdown = ContinuationSession(divergent_family, 0.0, 1.0,
+                                    lambda c: Richardson(criterion=c),
+                                    total_budget=3000,
+                                    criterion=RelativeResidual(tol=1e-4),
+                                    initial_step=0.5, min_step=1e-3)
+    return {"singular": (singular, "precondition_failed"),
+            "breakdown": (breakdown, "numerical_breakdown")}
+
+
+def test_verification_report_nonfinite_residual_is_strict_json():
+    """奇异矩阵与数值崩溃：非有限残差有明确可交换表示，报告是严格合法 JSON。
+
+    失败状态、原参数、原因与预算保留；失败残差不伪装成零或通过。
+    """
+    for name, (session, expected_status) in _nonfinite_report_scenarios().items():
+        session.run()
+        report = session.verification_report()
+        scheme = report["schemes"][0]
+        failed = [a for a in scheme["failed_attempts"]
+                  if a["status"] == expected_status]
+        assert failed, name + " 应产生 " + expected_status + " 失败尝试"
+        for attempt in failed:
+            # 非有限残差用明确字符串标记，不是零也不是有限数值
+            assert attempt["residual"] == "Infinity"
+            assert attempt["status"] != "converged"
+            assert attempt["t_from"] is not None
+            assert attempt["t_target"] is not None
+            assert attempt["iterations"] >= 0
+        # 严格 JSON：标准读取器可打开，无 Infinity/NaN 字面量
+        exported = session.export_verification_report(fmt="json")
+        parsed = _strict_json_loads(exported)
+        assert parsed == report
+        # 文本报告与 JSON 对每个失败尝试的解释一致
+        text = session.export_verification_report(fmt="text")
+        for attempt in failed:
+            assert "Infinity" in text
+            assert expected_status in text
+        # 正常收敛的确认节点仍是有限真实残差且通过独立核验
+        for node in scheme["confirmed_nodes"]:
+            assert isinstance(node["residual"], float)
+            assert node["verified"] is True
+
+
+def test_verification_report_nonfinite_residual_save_resume_consistent(tmp_path):
+    """保存恢复后重复导出：非有限标记、预算与归属完全一致。"""
+    from numexp import ContinuationSession
+
+    def family(t):
+        if t >= 0.5:
+            return LinearSystem(np.ones((4, 4)), np.ones(4))
+        return LinearSystem(np.diag(1.0 + np.arange(4)), np.ones(4))
+
+    session = ContinuationSession(family, 0.0, 1.0,
+                                  lambda c: ConjugateGradient(c),
+                                  total_budget=3000,
+                                  criterion=RelativeResidual(tol=1e-4),
+                                  initial_step=0.5, min_step=1e-3,
+                                  session_dir=str(tmp_path / "sess"))
+    session.run()
+    exported_json = session.export_verification_report(fmt="json")
+    exported_text = session.export_verification_report(fmt="text")
+    # 会话记录本身也是严格合法 JSON
+    _strict_json_loads((tmp_path / "sess" / "continuation.json")
+                       .read_text(encoding="utf-8"))
+    resumed = ContinuationSession.load(tmp_path / "sess", family,
+                                       lambda c: ConjugateGradient(c),
+                                       criterion=RelativeResidual(tol=1e-4))
+    assert resumed.export_verification_report(fmt="json") == exported_json
+    assert resumed.export_verification_report(fmt="text") == exported_text
+    report = resumed.verification_report()
+    assert report["budget_used"] == session.budget_used
+    assert report["budget"] == session.verification_report()["budget"]
+    failed = report["schemes"][0]["failed_attempts"]
+    assert any(a["residual"] == "Infinity" for a in failed)
+
+
+def test_verification_report_start_budget_insufficient_strict_json(tmp_path):
+    """起点预算不足：暂停尝试与待确认起点正常导出，严格 JSON 可解析。"""
+    from numexp import ContinuationSession
+    session = _make_continuation(tmp_path, budget=2,
+                                 session_dir=str(tmp_path / "sess"))
+    session.run()
+    report = session.verification_report()
+    scheme = report["schemes"][0]
+    assert scheme["status"] == "paused"
+    parsed = _strict_json_loads(session.export_verification_report(fmt="json"))
+    assert parsed == report
+    text = session.export_verification_report(fmt="text")
+    assert "暂停尝试" in text
+    resumed = ContinuationSession.load(tmp_path / "sess", _continuation_family,
+                                       lambda c: ConjugateGradient(c),
+                                       criterion=RelativeResidual(tol=1e-4))
+    assert resumed.export_verification_report(fmt="json") == \
+        session.export_verification_report(fmt="json")
