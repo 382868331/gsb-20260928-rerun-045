@@ -1,6 +1,7 @@
 """框架测试：前提检查、真实残差、停止分类、检查点续算、对照。"""
 
 import json
+import re
 
 import numpy as np
 import pytest
@@ -749,4 +750,174 @@ def test_verification_report_singular_system():
     failed = scheme["failed_attempts"]
     assert failed and failed[0]["status"] == "precondition_failed"
     assert failed[0]["iterations"] == 0
+    assert failed[0]["residual"] == {
+        "diagnostic": "scalar", "value": None,
+        "finite": False, "numeric_state": "undefined"}
     assert report["budget_used"] == 0
+
+
+@pytest.mark.parametrize("scenario", [
+    "singular", "numerical_breakdown", "start_budget", "converged"])
+def test_verification_report_diagnostic_scenarios_roundtrip(tmp_path, scenario):
+    """四类方案共同遵守严格 JSON、失败语义、预算与来源的保存恢复一致性。"""
+    from numexp import ContinuationSession
+
+    session_dir = tmp_path / scenario
+    if scenario == "singular":
+        def family(t):
+            return LinearSystem(np.ones((4, 4)), np.ones(4))
+
+        session = ContinuationSession(
+            family, 0.0, 1.0, lambda c: ConjugateGradient(c),
+            total_budget=100, criterion=RelativeResidual(tol=1e-4),
+            initial_step=0.5, min_step=1e-3, session_dir=session_dir)
+        expected_state = "undefined"
+        expected_status = "precondition_failed"
+    elif scenario == "numerical_breakdown":
+        session = ContinuationSession(
+            _continuation_family, 0.0, 1.0, lambda c: Richardson(1e308, c),
+            total_budget=10, criterion=RelativeResidual(tol=1e-4),
+            initial_step=0.5, min_step=1e-3, max_step_iters=5,
+            session_dir=session_dir)
+        expected_state = "positive_infinity"
+        expected_status = "numerical_breakdown"
+    elif scenario == "start_budget":
+        def family(t):
+            n = 7
+            b = 1.0 + np.arange(n)
+            diag = 2.0 + np.arange(n) + t
+            A = np.diag(diag) + 0.1 * t * (np.ones((n, n)) - np.eye(n))
+            return LinearSystem(A, b)
+
+        session = ContinuationSession(
+            family, 0.0, 1.0, lambda c: ConjugateGradient(c),
+            total_budget=3, criterion=RelativeResidual(tol=1e-12),
+            initial_step=0.5, min_step=1e-3, max_step_iters=10,
+            session_dir=session_dir)
+        expected_state = None
+        expected_status = "paused"
+    else:
+        session = _make_continuation(
+            tmp_path, budget=3000, session_dir=session_dir)
+        expected_state = None
+        expected_status = "converged"
+
+    session.run()
+    report = session.verification_report()
+    exported_json = session.export_verification_report(fmt="json")
+    exported_text = session.export_verification_report(fmt="text")
+    assert not re.search(r":\s*(?:NaN|-?Infinity)\b", exported_json)
+    parsed = json.loads(exported_json)
+    assert parsed == report
+
+    scheme = report["schemes"][0]
+    if scenario == "converged":
+        assert scheme["status"] == "completed"
+        assert scheme["confirmed_nodes"]
+        for index, node in enumerate(scheme["confirmed_nodes"]):
+            assert isinstance(node["residual"], float)
+            assert node["residual"] == pytest.approx(
+                session.verify_node("main", index))
+            assert node["verified"] is True
+            assert node["origin"] == "fresh" or node["origin"].startswith("node:")
+    else:
+        entries = (scheme["paused_attempts"] if scenario == "start_budget"
+                   else scheme["failed_attempts"])
+        assert entries
+        for entry in entries:
+            assert entry["status"] == expected_status
+            assert entry["message"]
+            assert entry["message"] in exported_text
+            assert "t=%g -> %g" % (entry["t_from"], entry["t_target"]) \
+                in exported_text
+            if expected_state is None:
+                assert isinstance(entry["residual"], float)
+                assert entry["residual"] > 0.0
+                assert "%0.3e" % entry["residual"] in exported_text
+            else:
+                assert entry["residual"] == {
+                    "diagnostic": "scalar", "value": None,
+                    "finite": False, "numeric_state": expected_state}
+                assert (("未定义" if expected_state == "undefined" else "+Inf")
+                        in exported_text)
+        assert expected_status in exported_text
+
+    assert report["budget"]["total"] == report["budget_used"]
+    restored = ContinuationSession.load(
+        session_dir, session.problem_at, session.make_solver,
+        criterion=session.criterion)
+    assert restored.budget_used == session.budget_used
+    assert restored.total_budget == session.total_budget
+    assert restored.export_verification_report(fmt="json") == exported_json
+    assert restored.export_verification_report(fmt="text") == exported_text
+
+
+def test_verification_report_mixed_failure_schemes_joint_export(tmp_path):
+    """正常、奇异、崩溃、预算不足方案在同一份报告中保持各自语义。"""
+    from numexp import ContinuationSession, ContinuationAttempt, ContinuationScheme
+
+    session_dir = tmp_path / "mixed"
+    session = _make_continuation(tmp_path, budget=3000,
+                                 session_dir=session_dir)
+    session.run()
+    pending_x = np.zeros(6)
+    joint_schemes = [
+        ContinuationScheme("singular", 1.0, step=0.5, status="stalled",
+                           pending={"t": 0.0, "x": pending_x, "origin": "fresh"}),
+        ContinuationScheme("breakdown", 1.0, step=0.5, status="stalled",
+                           pending={"t": 0.0, "x": pending_x, "origin": "fresh"}),
+        ContinuationScheme("start-budget", 1.0, step=0.5, status="paused",
+                           pending={"t": 0.0, "x": pending_x, "origin": "fresh"}),
+    ]
+    joint_attempts = [
+        ContinuationAttempt("singular", 0.0, 0.0, 0.0, 0,
+                            "precondition_failed", None, "矩阵奇异"),
+        ContinuationAttempt("breakdown", 0.0, 0.0, 0.0, 1,
+                            "numerical_breakdown", np.inf,
+                            "第 1 步出现 NaN/Inf（残差范数 inf）"),
+        ContinuationAttempt("start-budget", 0.0, 0.0, 0.0, 2,
+                            "paused", _continuation_family(0.0).residual_norm(pending_x),
+                            "起点确认预算不足"),
+    ]
+    session.schemes.extend(joint_schemes)
+    session.attempts.extend(joint_attempts)
+    session.budget_used += sum(a.iterations for a in joint_attempts)
+    session.save()
+
+    report = session.verification_report()
+    exported_json = session.export_verification_report(fmt="json")
+    exported_text = session.export_verification_report(fmt="text")
+    assert not re.search(r":\s*(?:NaN|-?Infinity)\b", exported_json)
+    assert json.loads(exported_json) == report
+    by_label = {s["label"]: s for s in report["schemes"]}
+
+    main = by_label["main"]
+    assert main["status"] == "completed"
+    for index, node in enumerate(main["confirmed_nodes"]):
+        assert node["verified"] is True
+        assert node["residual"] == pytest.approx(
+            session.verify_node("main", index))
+
+    singular = by_label["singular"]["failed_attempts"][0]
+    breakdown = by_label["breakdown"]["failed_attempts"][0]
+    paused = by_label["start-budget"]["paused_attempts"][0]
+    assert singular["residual"]["numeric_state"] == "undefined"
+    assert breakdown["residual"]["numeric_state"] == "positive_infinity"
+    assert isinstance(paused["residual"], float) and paused["residual"] > 0
+    for text_fragment in ("方案 singular", "矩阵奇异", "未定义",
+                          "方案 breakdown", "+Inf",
+                          "方案 start-budget", "起点确认预算不足"):
+        assert text_fragment in exported_text
+
+    restored = ContinuationSession.load(
+        session_dir, _continuation_family, lambda c: ConjugateGradient(c),
+        criterion=RelativeResidual(tol=1e-4))
+    assert restored.budget_used == session.budget_used
+    assert restored.total_budget == session.total_budget
+    assert {s.label for s in restored.schemes} == {
+        "main", "singular", "breakdown", "start-budget"}
+    assert restored.attempts[-3].residual is None
+    assert np.isposinf(restored.attempts[-2].residual)
+    assert np.isfinite(restored.attempts[-1].residual)
+    assert restored.export_verification_report(fmt="json") == exported_json
+    assert restored.export_verification_report(fmt="text") == exported_text
